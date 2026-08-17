@@ -32,22 +32,30 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      - name: Build Tauri EXE
+      - name: Build Tauri (raw EXE)
+        run: npm run tauri build -- --bundles none
+
+      - name: Build Tauri installers (NSIS/MSI)
+        if: startsWith(github.ref, 'refs/tags/v')
         run: npm run tauri build
 
       - name: Find built artifacts
         id: find
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path "src-tauri/target/release" -Filter "*.exe" -File | Select-Object -ExpandProperty FullName
-          $nsis = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-          $msi = Get-ChildItem -Path "src-tauri/target/release/bundle/msi" -Filter "*.msi" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-          Write-Output "exe=$exe"
+          $exePath = Join-Path $env:GITHUB_WORKSPACE "src-tauri/target/release"
+          $exe = Get-ChildItem -Path $exePath -Filter "*.exe" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'nsis|setup' } | Select-Object -First 1 -ExpandProperty FullName
+          $nsisPath = Join-Path $env:GITHUB_WORKSPACE "src-tauri/target/release/bundle/nsis"
+          $nsis = Get-ChildItem -Path $nsisPath -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          $msiPath = Join-Path $env:GITHUB_WORKSPACE "src-tauri/target/release/bundle/msi"
+          $msi = Get-ChildItem -Path $msiPath -Filter "*.msi" -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+
+          if ($exe) { Write-Output "exe=$exe" }
           if ($nsis) { Write-Output "nsis=$nsis" }
           if ($msi) { Write-Output "msi=$msi" }
 
       - name: Upload EXE artifact
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: steps.find.outputs.exe
         uses: actions/upload-artifact@v4
         with:
           name: toolsplus-exe
@@ -55,7 +63,7 @@ jobs:
           retention-days: 7
 
       - name: Upload NSIS installer
-        if: steps.find.outputs.nsis && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        if: steps.find.outputs.nsis
         uses: actions/upload-artifact@v4
         with:
           name: toolsplus-installer
@@ -63,7 +71,7 @@ jobs:
           retention-days: 7
 
       - name: Upload MSI installer
-        if: steps.find.outputs.msi && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        if: steps.find.outputs.msi
         uses: actions/upload-artifact@v4
         with:
           name: toolsplus-msi
