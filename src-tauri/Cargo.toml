@@ -41,4 +41,5 @@ windows = { version = "0.58", features = [
 base64 = "0.22"
 winreg = "0.52"
 rfd = "0.14"
+portable-pty = "0.8"
 

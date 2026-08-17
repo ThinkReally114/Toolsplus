@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { inject, ref, computed, onMounted } from "vue";
+import { inject, ref, computed, onMounted, onBeforeUnmount, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import PageShell from "@/components/PageShell.vue";
 import WinTextBlock from "@winui/components/WinTextBlock.vue";
 import WinButton from "@winui/components/WinButton.vue";
 import WinTextBox from "@winui/components/WinTextBox.vue";
 import WinHyperlinkButton from "@winui/components/WinHyperlinkButton.vue";
 import WinSelectorBar from "@winui/components/WinSelectorBar.vue";
+import WinContentDialog from "@winui/components/WinContentDialog.vue";
+import WinProgressRing from "@winui/components/WinProgressRing.vue";
 import AppIcon from "@/components/AppIcon.vue";
 import { i18nKey, type I18n } from "@winui/components/i18n/index";
 
@@ -35,10 +38,25 @@ interface GitCommit {
   message: string;
 }
 
+interface GhAuthState {
+  gh_installed: boolean;
+  logged_in: boolean;
+  user: string;
+  host: string;
+}
+
 const hasTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
 const checking = ref(true);
-const gitReady = ref(false);
+const gitInstalled = ref(false);
+const ghInstalled = ref(false);
+const installing = ref(false);
+const installError = ref("");
+const installLog = ref("");
+
+const authState = ref<GhAuthState | null>(null);
+
 const repoPath = ref("");
 const repoError = ref("");
 const status = ref<GitStatus | null>(null);
@@ -67,6 +85,83 @@ const canCommit = computed(
 const cloneUrl = ref("");
 const cloneTarget = ref("");
 const cloning = ref(false);
+
+const branches = ref<string[]>([]);
+const selectedBranch = ref("");
+
+const gitTab = ref("changes");
+const gitTabItems = computed(() => [
+  { Text: i18n.t("git.tabChanges"), Tag: "changes" },
+  { Text: i18n.t("git.tabHistory"), Tag: "history" },
+]);
+
+function onGitTabChanged(sender: any) {
+  const selected = sender?.SelectedItem;
+  const index = Math.max(0, sender?.Items?.indexOf(selected) ?? 0);
+  gitTab.value = sender?.Items?.[index]?.Tag ?? "changes";
+}
+
+// 登录流程状态
+const needLoginDialog = ref(false);
+const loginWizardOpen = ref(false);
+const loginStep = ref(0);
+const loginLogs = ref<string[]>([]);
+const loginError = ref("");
+const loginUserName = ref("");
+const loginUserEmail = ref("");
+const logoutBusy = ref(false);
+
+// 集成终端面板
+const terminalOutput = ref("");
+const terminalInput = ref("");
+const terminalExited = ref(false);
+const terminalRef = ref<HTMLDivElement | null>(null);
+let ptyUnlisten: UnlistenFn | null = null;
+
+function appendLog(line: string) {
+  loginLogs.value.push(`[${new Date().toLocaleTimeString()}] ${line}`);
+}
+
+function appendTerminal(text: string) {
+  terminalOutput.value += text;
+  // 检测进程退出标记
+  if (text.includes("[gh 进程已退出")) {
+    terminalExited.value = true;
+  }
+  nextTick(() => {
+    const el = terminalRef.value;
+    if (el) el.scrollTop = el.scrollHeight;
+  });
+}
+
+async function sendTerminalInput() {
+  const text = terminalInput.value;
+  if (!text && !terminalExited.value) return;
+  // 进程已退出时按回车也只发送换行
+  const payload = text + "\r";
+  try {
+    await invoke("gh_login_input", { text: payload });
+    terminalInput.value = "";
+  } catch (e) {
+    loginError.value = String(e);
+  }
+}
+
+async function sendEnter() {
+  try {
+    await invoke("gh_login_input", { text: "\r" });
+  } catch (e) {
+    loginError.value = String(e);
+  }
+}
+
+async function terminatePty() {
+  try {
+    await invoke("gh_login_terminate");
+  } catch {
+    // ignore
+  }
+}
 
 async function browseFolder() {
   try {
@@ -150,27 +245,6 @@ function statusText(f: GitFile): string {
   return i18n.t(STATUS_KEYS[code] ?? "git.fileM");
 }
 
-onMounted(async () => {
-  if (!hasTauri) {
-    checking.value = false;
-    return;
-  }
-  try {
-    const auth = await invoke<any>("gh_auth_state");
-    authState.value = auth;
-    if (auth.gh_installed) {
-      gitReady.value = true;
-      repoPath.value = await invoke<string>("git_default_dir");
-      await detectRepo();
-      if (!auth.logged_in && !webLoginOpened.value) {
-        await openWebLogin();
-      }
-    }
-  } finally {
-    checking.value = false;
-  }
-});
-
 async function detectRepo() {
   repoError.value = "";
   notice.value = "";
@@ -184,15 +258,12 @@ async function detectRepo() {
       await refreshAll();
       await refreshBranches();
       await refreshAuth();
-      if (authState.value?.gh_installed && !authState.value?.logged_in && !webLoginOpened.value) {
-        await openWebLogin();
-      }
+      await checkLoginNeeded();
     } else {
       repoError.value = "norepo";
       status.value = null;
       commits.value = [];
       branches.value = [];
-      authState.value = null;
     }
   } catch (e) {
     repoError.value = String(e);
@@ -200,28 +271,19 @@ async function detectRepo() {
 }
 
 async function refreshAuth() {
-  if (!repoPath.value) return;
   try {
-    authState.value = await invoke("gh_auth_state");
-    if (authState.value?.gh_installed && !authState.value?.logged_in && !webLoginOpened.value) {
-      await openWebLogin();
-    }
+    authState.value = await invoke<GhAuthState>("gh_auth_state");
   } catch {
     authState.value = null;
   }
 }
 
-async function openWebLogin() {
-  if (webLoginOpened.value) return;
-  webLoginOpened.value = true;
-  try {
-    await invoke("gh_login_web");
-    notice.value = "weblogin";
-    await new Promise((r) => setTimeout(r, 3000));
-    await refreshAuth();
-  } catch (e) {
-    repoError.value = String(e);
-  }
+async function checkLoginNeeded() {
+  if (!ghInstalled.value) return;
+  if (authState.value?.logged_in) return;
+  if (loginWizardOpen.value) return;
+  if (needLoginDialog.value) return;
+  needLoginDialog.value = true;
 }
 
 async function refreshBranches() {
@@ -318,24 +380,21 @@ async function push() {
   }
 }
 
-async function saveCredential() {
-  loginMsg.value = "";
-  try {
-    await invoke("gh_setup_git", { repo: repoPath.value });
-    loginMsg.value = i18n.t("git.loginSaved");
-    await refreshAuth();
-    setTimeout(() => (showLogin.value = false), 1500);
-  } catch (e) {
-    loginMsg.value = String(e);
-  }
-}
-
-async function installGhNow() {
+async function installGitAndGhNow() {
   installing.value = true;
   installError.value = "";
+  installLog.value = "";
   try {
-    await invoke("install_gh");
-    await refreshAuth();
+    const out = await invoke<string>("install_git_and_gh");
+    installLog.value = out;
+    // 重新检测安装状态
+    gitInstalled.value = await invoke<boolean>("check_git");
+    authState.value = await invoke<GhAuthState>("gh_auth_state");
+    ghInstalled.value = authState.value?.gh_installed ?? false;
+    if (gitInstalled.value && ghInstalled.value) {
+      repoPath.value = await invoke<string>("git_default_dir");
+      await detectRepo();
+    }
   } catch (e) {
     installError.value = String(e);
   } finally {
@@ -347,74 +406,215 @@ function openGitSite() {
   window.open("https://git-scm.com/downloads", "_blank", "noopener,noreferrer");
 }
 
-const installing = ref(false);
-const installError = ref("");
-
-const branches = ref<string[]>([]);
-const selectedBranch = ref("");
-const showLogin = ref(false);
-const loginUser = ref("");
-const loginToken = ref("");
-const loginMsg = ref("");
-const authState = ref<{ gh_installed: boolean; logged_in: boolean; user: string; host: string } | null>(null);
-const webLoginOpened = ref(false);
-
-const gitTab = ref("changes");
-const gitTabItems = computed(() => [
-  { Text: i18n.t("git.tabChanges"), Tag: "changes" },
-  { Text: i18n.t("git.tabHistory"), Tag: "history" },
-]);
-
-function onGitTabChanged(sender: any) {
-  const selected = sender?.SelectedItem;
-  const index = Math.max(0, sender?.Items?.indexOf(selected) ?? 0);
-  gitTab.value = sender?.Items?.[index]?.Tag ?? "changes";
+function openGhSite() {
+  window.open("https://cli.github.com/", "_blank", "noopener,noreferrer");
 }
 
-async function installNow() {
-  installing.value = true;
-  installError.value = "";
+async function logoutGithub() {
+  logoutBusy.value = true;
+  notice.value = "";
   try {
-    await invoke("install_gh");
-    const auth = await invoke<any>("gh_auth_state");
-    authState.value = auth;
-    if (auth.gh_installed) {
-      gitReady.value = true;
+    await invoke<string>("gh_logout");
+    await refreshAuth();
+    notice.value = "loggedOut";
+  } catch (e) {
+    repoError.value = String(e);
+  } finally {
+    logoutBusy.value = false;
+  }
+}
+
+async function startLoginWizard() {
+  needLoginDialog.value = false;
+  loginWizardOpen.value = true;
+  loginStep.value = 0;
+  loginLogs.value = [];
+  loginError.value = "";
+  loginUserName.value = "";
+  loginUserEmail.value = "";
+  terminalOutput.value = "";
+  terminalInput.value = "";
+  terminalExited.value = false;
+
+  // 启动事件监听
+  if (ptyUnlisten) {
+    ptyUnlisten();
+    ptyUnlisten = null;
+  }
+  try {
+    ptyUnlisten = await listen<string>("gh-login-output", (e) => {
+      appendTerminal(e.payload);
+    });
+  } catch (e) {
+    loginError.value = String(e);
+    return;
+  }
+
+  appendLog(i18n.t("git.wizStart"));
+  appendLog(i18n.t("git.wizStep1"));
+  loginStep.value = 1;
+  try {
+    await invoke("gh_login_interactive");
+    appendLog(i18n.t("git.wizLoginWindowOpened"));
+    loginStep.value = 2;
+    appendLog(i18n.t("git.wizWaitingLogin"));
+    // 等待终端退出，由 PTY 输出事件触发
+    await waitForTerminalExit(300);
+    // 退出后检测登录状态
+    await refreshAuth();
+    if (authState.value?.logged_in) {
+      const user = authState.value.user || "unknown";
+      appendLog(i18n.t("git.wizLoginSuccess", { user }));
+      loginStep.value = 3;
+      appendLog(i18n.t("git.wizStep3"));
+      if (repoPath.value) {
+        try {
+          await invoke("gh_setup_git", { repo: repoPath.value });
+          appendLog(i18n.t("git.wizSetupGitOk"));
+        } catch (e) {
+          appendLog(i18n.t("git.wizSetupGitFail", { err: String(e) }));
+        }
+      } else {
+        appendLog(i18n.t("git.wizSetupGitSkip"));
+      }
+      loginStep.value = 4;
+      appendLog(i18n.t("git.wizStep4"));
+      try {
+        const cfg = await invoke<[string, string]>("git_get_user_config");
+        loginUserName.value = cfg[0] || "";
+        loginUserEmail.value = cfg[1] || "";
+      } catch {
+        // ignore
+      }
+    } else {
+      appendLog(i18n.t("git.wizError", { err: "未检测到登录状态" }));
+    }
+  } catch (e) {
+    loginError.value = String(e);
+    appendLog(i18n.t("git.wizError", { err: String(e) }));
+  }
+}
+
+function waitForTerminalExit(timeoutSecs: number): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (terminalExited.value) {
+        resolve();
+        return;
+      }
+      if (Date.now() - start > timeoutSecs * 1000) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 500);
+    };
+    tick();
+  });
+}
+
+async function saveGitConfig() {
+  if (!loginUserName.value.trim() || !loginUserEmail.value.trim()) {
+    loginError.value = i18n.t("git.wizConfigEmpty");
+    return;
+  }
+  loginError.value = "";
+  try {
+    await invoke("git_config_user", {
+      name: loginUserName.value,
+      email: loginUserEmail.value,
+    });
+    appendLog(i18n.t("git.wizConfigSaved", { name: loginUserName.value, email: loginUserEmail.value }));
+    loginStep.value = 5;
+    appendLog(i18n.t("git.wizDone"));
+    await refreshAuth();
+    setTimeout(() => {
+      loginWizardOpen.value = false;
+    }, 2000);
+  } catch (e) {
+    loginError.value = String(e);
+    appendLog(i18n.t("git.wizError", { err: String(e) }));
+  }
+}
+
+function closeLoginWizard() {
+  loginWizardOpen.value = false;
+  // 关闭时终止未完成的 PTY 会话
+  if (!terminalExited.value) {
+    terminatePty();
+  }
+  if (ptyUnlisten) {
+    ptyUnlisten();
+    ptyUnlisten = null;
+  }
+  refreshAuth();
+}
+
+onMounted(async () => {
+  if (!hasTauri) {
+    checking.value = false;
+    return;
+  }
+  try {
+    gitInstalled.value = await invoke<boolean>("check_git");
+    authState.value = await invoke<GhAuthState>("gh_auth_state");
+    ghInstalled.value = authState.value?.gh_installed ?? false;
+    if (gitInstalled.value && ghInstalled.value) {
       repoPath.value = await invoke<string>("git_default_dir");
       await detectRepo();
     }
   } catch (e) {
-    installError.value = String(e);
+    console.error(e);
   } finally {
-    installing.value = false;
+    checking.value = false;
   }
-}
+});
+
+onBeforeUnmount(() => {
+  if (ptyUnlisten) {
+    ptyUnlisten();
+    ptyUnlisten = null;
+  }
+  if (!terminalExited.value) {
+    terminatePty();
+  }
+});
 </script>
 
 <template>
   <PageShell title-key="git.title" subtitle-key="git.subtitle">
-    <div v-if="checking" class="git-hint">
-      <WinTextBlock :Text="i18n.t('git.checking')" Style="opacity:.6" />
+    <div v-if="checking" class="git-checking">
+      <WinProgressRing
+        :IsActive="true"
+        :IsIndeterminate="true"
+        :Width="36"
+        :Height="36"
+      />
     </div>
 
-    <div v-else-if="!gitReady" class="git-card git-install-card">
+    <div v-else-if="!gitInstalled || !ghInstalled" class="git-card git-install-card">
       <div class="git-install-icon">
         <AppIcon name="git" :size="32" />
       </div>
       <div class="git-install-body">
-        <WinTextBlock :Text="i18n.t('git.ghNotInstalled')" Style="font-size:18px;font-weight:600" />
-        <WinTextBlock :Text="i18n.t('git.ghInstallHint')" Style="font-size:13px;opacity:.75" Foreground="secondary" />
+        <WinTextBlock :Text="i18n.t('git.toolsNotInstalled')" Style="font-size:18px;font-weight:600" />
+        <WinTextBlock :Text="i18n.t('git.toolsInstallHint')" Style="font-size:13px;opacity:.75" Foreground="secondary" />
         <div class="git-install-actions">
           <WinButton
             Style="AccentButtonStyle"
-            :Content="installing ? i18n.t('git.installingGh') : i18n.t('git.installGh')"
+            :Content="installing ? i18n.t('git.installing') : i18n.t('git.installBoth')"
             :IsEnabled="!installing"
-            @click="installNow"
+            @click="installGitAndGhNow"
+          />
+          <WinHyperlinkButton
+            NavigateUri="https://git-scm.com/downloads"
+            TargetName="_blank"
+            :Content="i18n.t('git.downloadGit')"
           />
           <WinHyperlinkButton
             NavigateUri="https://cli.github.com/"
             TargetName="_blank"
-            :Content="i18n.t('git.ghDownload')"
+            :Content="i18n.t('git.downloadGh')"
           />
         </div>
         <WinTextBlock
@@ -509,14 +709,14 @@ async function installNow() {
       <div v-if="notice === 'pushed'" class="git-card git-ok">
         <WinTextBlock :Text="i18n.t('git.pushSuccess')" Style="color:var(--accent, #005fb8)" />
       </div>
-      <div v-if="notice === 'weblogin'" class="git-card git-ok">
-        <WinTextBlock :Text="i18n.t('git.webLoginOpened')" Style="color:var(--accent, #005fb8)" />
-      </div>
       <div v-if="notice === 'cloned'" class="git-card git-ok">
         <WinTextBlock :Text="i18n.t('git.cloneSuccess')" Style="color:var(--accent, #005fb8)" />
       </div>
       <div v-if="notice === 'pulled'" class="git-card git-ok">
         <WinTextBlock :Text="i18n.t('git.pullSuccess')" Style="color:var(--accent, #005fb8)" />
+      </div>
+      <div v-if="notice === 'loggedOut'" class="git-card git-ok">
+        <WinTextBlock :Text="i18n.t('git.logoutSuccess')" Style="color:var(--accent, #005fb8)" />
       </div>
 
       <template v-if="status">
@@ -531,6 +731,12 @@ async function installNow() {
           <div class="git-branch-row">
             <AppIcon name="git" :size="20" />
             <WinTextBlock :Text="status.branch || '—'" Style="font-size:16px;font-weight:600" />
+            <WinTextBlock
+              v-if="authState?.logged_in && authState?.user"
+              :Text="i18n.t('git.loggedAs', { user: authState.user, host: authState.host || 'github.com' })"
+              Style="font-size:12px"
+              Foreground="secondary"
+            />
             <WinTextBlock
               v-if="status.ahead > 0"
               :Text="i18n.t('git.ahead', { n: status.ahead })"
@@ -633,68 +839,22 @@ async function installNow() {
               :IsEnabled="!busy"
             />
             <WinButton
-              :Content="i18n.t('git.login')"
-              @click="showLogin = !showLogin"
-              :IsEnabled="!busy"
+              v-if="authState?.logged_in"
+              :Content="logoutBusy ? i18n.t('git.loggingOut') : i18n.t('git.switchAccount')"
+              @click="startLoginWizard"
+              :IsEnabled="!busy && !logoutBusy"
             />
-          </div>
-
-          <div v-if="showLogin" class="git-login-card">
-            <WinTextBlock :Text="i18n.t('git.loginTitle')" Style="font-size:14px;font-weight:600" />
-
-            <div v-if="authState && !authState.gh_installed" class="git-gh-missing">
-              <WinTextBlock :Text="i18n.t('git.ghNotInstalled')" Style="font-size:13px;opacity:.8" />
-              <div class="git-login-actions">
-                <WinButton
-                  :Content="installing ? i18n.t('git.installing') : i18n.t('git.installGh')"
-                  Style="AccentButtonStyle"
-                  @click="installGhNow"
-                  :IsEnabled="!installing"
-                />
-                <WinTextBlock
-                  v-if="installError"
-                  :Text="installError"
-                  Style="font-size:12px;color:var(--system-error, #c42b1c)"
-                />
-              </div>
-            </div>
-
-            <div v-else-if="authState && authState.logged_in" class="git-gh-logged">
-              <WinTextBlock
-                :Text="i18n.t('git.loggedAs', { user: authState.user || '—', host: authState.host || 'github.com' })"
-                Style="font-size:13px;opacity:.85"
-              />
-              <div class="git-login-actions">
-                <WinButton
-                  :Content="i18n.t('git.setupGit')"
-                  Style="AccentButtonStyle"
-                  @click="saveCredential"
-                  :IsEnabled="!busy"
-                />
-                <WinTextBlock
-                  v-if="loginMsg"
-                  :Text="loginMsg"
-                  Style="font-size:12px;color:var(--accent, #005fb8)"
-                />
-              </div>
-            </div>
-
-            <div v-else class="git-gh-notlogged">
-              <WinTextBlock :Text="i18n.t('git.ghLoginHint')" Style="font-size:13px;opacity:.8" />
-              <div class="git-login-actions">
-                <WinButton
-                  :Content="i18n.t('git.openWebLogin')"
-                  Style="AccentButtonStyle"
-                  @click="openWebLogin"
-                  :IsEnabled="!busy"
-                />
-              </div>
-            </div>
-
-            <WinTextBlock
-              :Text="i18n.t('git.loginHint')"
-              Style="font-size:12px;opacity:.6"
-              Foreground="secondary"
+            <WinButton
+              v-if="authState?.logged_in"
+              :Content="logoutBusy ? i18n.t('git.loggingOut') : i18n.t('git.logout')"
+              @click="logoutGithub"
+              :IsEnabled="!busy && !logoutBusy"
+            />
+            <WinButton
+              v-else
+              :Content="i18n.t('git.relogin')"
+              @click="startLoginWizard"
+              :IsEnabled="!busy"
             />
           </div>
         </section>
@@ -727,12 +887,113 @@ async function installNow() {
         </section>
       </template>
     </template>
+
+    <WinContentDialog
+      v-model:IsOpen="needLoginDialog"
+      :Title="i18n.t('git.needLoginTitle')"
+      :Content="i18n.t('git.needLoginContent')"
+      :PrimaryButtonText="i18n.t('git.needLoginConfirm')"
+      :CloseButtonText="i18n.t('git.needLoginCancel')"
+      DefaultButton="Primary"
+      @PrimaryButtonClick="startLoginWizard"
+    />
+
+    <WinContentDialog
+      v-model:IsOpen="loginWizardOpen"
+      :Title="i18n.t('git.wizardTitle')"
+      :PrimaryButtonText="loginStep >= 4 ? i18n.t('git.wizSave') : ''"
+      :CloseButtonText="loginStep >= 5 ? i18n.t('git.wizClose') : i18n.t('git.wizCancel')"
+      :IsPrimaryButtonEnabled="loginStep >= 4 && !!loginUserName.trim() && !!loginUserEmail.trim()"
+      @PrimaryButtonClick="saveGitConfig"
+      @CloseButtonClick="closeLoginWizard"
+    >
+      <div class="wiz-container">
+        <div class="wiz-steps">
+          <div class="wiz-step" :class="{ active: loginStep === 1, done: loginStep > 1 }">1. {{ i18n.t('git.wizStep1Short') }}</div>
+          <div class="wiz-step" :class="{ active: loginStep === 2, done: loginStep > 2 }">2. {{ i18n.t('git.wizStep2Short') }}</div>
+          <div class="wiz-step" :class="{ active: loginStep === 3, done: loginStep > 3 }">3. {{ i18n.t('git.wizStep3Short') }}</div>
+          <div class="wiz-step" :class="{ active: loginStep === 4, done: loginStep > 4 }">4. {{ i18n.t('git.wizStep4Short') }}</div>
+        </div>
+
+        <div class="wiz-terminal-panel">
+          <div class="wiz-terminal-header">
+            <span class="wiz-terminal-title">{{ i18n.t('git.wizTerminal') }}</span>
+            <div class="wiz-terminal-actions">
+              <WinButton
+                :Content="i18n.t('git.wizEnter')"
+                @click="sendEnter"
+                :IsEnabled="!terminalExited"
+                Style="font-size:12px"
+              />
+              <WinButton
+                :Content="i18n.t('git.wizAbort')"
+                @click="terminatePty"
+                :IsEnabled="!terminalExited"
+                Style="font-size:12px"
+              />
+            </div>
+          </div>
+          <div ref="terminalRef" class="wiz-terminal-output">
+            <pre>{{ terminalOutput || i18n.t('git.wizTerminalEmpty') }}</pre>
+          </div>
+          <div class="wiz-terminal-input-row">
+            <input
+              v-model="terminalInput"
+              class="wiz-terminal-input"
+              :placeholder="i18n.t('git.wizTerminalInputHint')"
+              :disabled="terminalExited"
+              @keydown.enter.prevent="sendTerminalInput"
+            />
+            <WinButton
+              :Content="i18n.t('git.wizSend')"
+              @click="sendTerminalInput"
+              :IsEnabled="!terminalExited"
+              Style="font-size:12px"
+            />
+          </div>
+          <div v-if="loginLogs.length" class="wiz-logs">
+            <div v-for="(line, i) in loginLogs" :key="i" class="wiz-log-line">{{ line }}</div>
+            <div v-if="loginError" class="wiz-log-line wiz-log-error">{{ loginError }}</div>
+          </div>
+        </div>
+
+        <div v-if="loginStep === 4" class="wiz-config-form">
+          <div class="wiz-config-row">
+            <label>{{ i18n.t('git.wizName') }}</label>
+            <input
+              v-model="loginUserName"
+              class="wiz-config-input"
+              :placeholder="i18n.t('git.wizNamePlaceholder')"
+            />
+          </div>
+          <div class="wiz-config-row">
+            <label>{{ i18n.t('git.wizEmail') }}</label>
+            <input
+              v-model="loginUserEmail"
+              class="wiz-config-input"
+              :placeholder="i18n.t('git.wizEmailPlaceholder')"
+            />
+          </div>
+        </div>
+
+        <div v-if="loginStep === 5" class="wiz-done">
+          <WinTextBlock :Text="i18n.t('git.wizDone')" Style="color:var(--accent, #005fb8)" />
+        </div>
+      </div>
+    </WinContentDialog>
   </PageShell>
 </template>
 
 <style scoped>
 .git-hint {
   padding: 12px 0;
+}
+
+.git-checking {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 0;
 }
 
 .git-toolbar {
@@ -967,51 +1228,6 @@ html.theme-dark .git-remote-actions {
   border-top-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.07));
 }
 
-.git-login-card {
-  margin-top: 10px;
-  padding: 12px 14px;
-  border-radius: 8px;
-  border: 1px dashed var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.14));
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.git-login-field {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.git-login-field label {
-  width: 60px;
-  font-size: 13px;
-  opacity: 0.8;
-  flex-shrink: 0;
-}
-
-.git-login-input {
-  flex: 1;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.12));
-  background: var(--SolidBackgroundFillColorBaseBrush, rgba(255, 255, 255, 0.6));
-  color: inherit;
-  font-size: 13px;
-}
-
-html.theme-dark .git-login-input {
-  background: var(--SolidBackgroundFillColorBaseBrush, rgba(32, 32, 32, 0.6));
-  border-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.1));
-}
-
-.git-login-actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
 .git-commit-row {
   display: flex;
   align-items: baseline;
@@ -1042,5 +1258,207 @@ html.theme-dark .git-commit-hash {
   flex-shrink: 0;
   font-size: 12px;
   opacity: 0.65;
+}
+
+.wiz-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  min-width: 480px;
+  max-width: 640px;
+}
+
+.wiz-steps {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.wiz-step {
+  flex: 1;
+  min-width: 100px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--ControlFillColorSecondaryBrush, rgba(0, 0, 0, 0.04));
+  font-size: 12px;
+  color: var(--TextFillColorSecondaryBrush, rgba(0, 0, 0, 0.6));
+  border: 1px solid transparent;
+}
+
+html.theme-dark .wiz-step {
+  background: var(--ControlFillColorSecondaryBrush, rgba(255, 255, 255, 0.05));
+  color: var(--TextFillColorSecondaryBrush, rgba(255, 255, 255, 0.6));
+}
+
+.wiz-step.active {
+  border-color: var(--AccentButtonBackground, #005fb8);
+  color: var(--AccentButtonBackground, #005fb8);
+  font-weight: 600;
+}
+
+html.theme-dark .wiz-step.active {
+  border-color: #4cc2ff;
+  color: #4cc2ff;
+}
+
+.wiz-step.done {
+  color: #6ccb5f;
+  background: color-mix(in srgb, #6ccb5f 12%, transparent);
+}
+
+.wiz-log-panel {
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 6px;
+  padding: 10px 12px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+html.theme-dark .wiz-log-panel {
+  background: rgba(0, 0, 0, 0.3);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.wiz-log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.wiz-log-error {
+  color: var(--system-error, #c42b1c);
+}
+
+.wiz-terminal-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wiz-terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wiz-terminal-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--TextFillColorSecondaryBrush, rgba(0, 0, 0, 0.7));
+}
+
+html.theme-dark .wiz-terminal-title {
+  color: var(--TextFillColorSecondaryBrush, rgba(255, 255, 255, 0.7));
+}
+
+.wiz-terminal-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.wiz-terminal-output {
+  background: #0c0c0c;
+  color: #e6e6e6;
+  border-radius: 6px;
+  padding: 10px 12px;
+  height: 220px;
+  max-height: 220px;
+  overflow-y: auto;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.wiz-terminal-output pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: inherit;
+}
+
+.wiz-terminal-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wiz-terminal-input {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.12));
+  background: var(--SolidBackgroundFillColorBaseBrush, rgba(255, 255, 255, 0.6));
+  color: inherit;
+  font-size: 13px;
+  font-family: "Cascadia Code", "Consolas", monospace;
+}
+
+html.theme-dark .wiz-terminal-input {
+  background: var(--SolidBackgroundFillColorBaseBrush, rgba(32, 32, 32, 0.6));
+  border-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.1));
+}
+
+.wiz-terminal-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.wiz-logs {
+  max-height: 120px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.04);
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+html.theme-dark .wiz-logs {
+  background: rgba(0, 0, 0, 0.3);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.wiz-config-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 0;
+}
+
+.wiz-config-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.wiz-config-row label {
+  width: 80px;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.wiz-config-input {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.12));
+  background: var(--SolidBackgroundFillColorBaseBrush, rgba(255, 255, 255, 0.6));
+  color: inherit;
+  font-size: 13px;
+}
+
+html.theme-dark .wiz-config-input {
+  background: var(--SolidBackgroundFillColorBaseBrush, rgba(32, 32, 32, 0.6));
+  border-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.1));
+}
+
+.wiz-done {
+  padding: 8px 0;
 }
 </style>

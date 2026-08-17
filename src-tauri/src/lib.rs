@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tauri::command;
+use tauri::{command, Emitter};
 
 /// 扫描结果项
 #[derive(serde::Serialize)]
@@ -21,18 +21,31 @@ struct CleanTarget {
 
 /// 递归计算目录大小（字节数），遇到无权限或不存在返回 0
 fn dir_size(path: &Path) -> u64 {
+    const MAX_DEPTH: u32 = 32;
+    const MAX_ENTRIES: usize = 5_000_000;
     let total = AtomicU64::new(0);
+    let visited = AtomicU64::new(0);
     if !path.exists() {
         return 0;
     }
     let stack = vec![path.to_path_buf()];
     let mut current = stack;
+    let mut depth_stack = vec![0u32];
     while let Some(dir) = current.pop() {
+        let depth = depth_stack.pop().unwrap_or(0);
+        if depth > MAX_DEPTH {
+            continue;
+        }
+        // 限制扫描条目数避免长时间卡死
+        if visited.load(Ordering::Relaxed) > MAX_ENTRIES as u64 {
+            break;
+        }
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            visited.fetch_add(1, Ordering::Relaxed);
             let p = entry.path();
             let ft = match entry.file_type() {
                 Ok(t) => t,
@@ -40,6 +53,7 @@ fn dir_size(path: &Path) -> u64 {
             };
             if ft.is_dir() {
                 current.push(p);
+                depth_stack.push(depth + 1);
             } else if ft.is_file() {
                 if let Ok(meta) = entry.metadata() {
                     total.fetch_add(meta.len(), Ordering::Relaxed);
@@ -80,29 +94,33 @@ fn expand_path(raw: &str) -> String {
     out
 }
 
-/// 扫描 C 盘常见可回收垃圾
+/// 扫描 C 盘常见可回收垃圾（异步：放到线程池避免阻塞 UI）
 #[command]
-fn scan_junk() -> Vec<JunkItem> {
-    let targets: [(&str, &str); 5] = [
-        ("temp", "%TEMP%"),
-        ("windowsTemp", "%SYSTEMROOT%\\Temp"),
-        ("recycle", "C:\\$Recycle.Bin"),
-        ("prefetch", "%SYSTEMROOT%\\Prefetch"),
-        ("logs", "%SYSTEMROOT%\\Logs"),
-    ];
+async fn scan_junk() -> Vec<JunkItem> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let targets: [(&str, &str); 5] = [
+            ("temp", "%TEMP%"),
+            ("windowsTemp", "%SYSTEMROOT%\\Temp"),
+            ("recycle", "C:\\$Recycle.Bin"),
+            ("prefetch", "%SYSTEMROOT%\\Prefetch"),
+            ("logs", "%SYSTEMROOT%\\Logs"),
+        ];
 
-    targets
-        .iter()
-        .map(|(key, raw)| {
-            let expanded = expand_path(raw);
-            let size = dir_size(Path::new(&expanded));
-            JunkItem {
-                key: key.to_string(),
-                path: expanded,
-                size,
-            }
-        })
-        .collect()
+        targets
+            .iter()
+            .map(|(key, raw)| {
+                let expanded = expand_path(raw);
+                let size = dir_size(Path::new(&expanded));
+                JunkItem {
+                    key: key.to_string(),
+                    path: expanded,
+                    size,
+                }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// 递归删除目录下所有内容（保留目录本身）
@@ -154,22 +172,26 @@ fn empty_recycle_bin() -> bool {
     .is_ok()
 }
 
-/// 清理选中的垃圾项
+/// 清理选中的垃圾项（异步：放到线程池避免阻塞 UI）
 #[command]
-fn clean_junk(targets: Vec<CleanTarget>) -> u64 {
-    let mut total = 0u64;
-    for t in targets {
-        let path = Path::new(&t.path);
-        if t.key == "recycle" {
-            let before = dir_size(path);
-            if empty_recycle_bin() {
-                total += before;
+async fn clean_junk(targets: Vec<CleanTarget>) -> u64 {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut total = 0u64;
+        for t in targets {
+            let path = Path::new(&t.path);
+            if t.key == "recycle" {
+                let before = dir_size(path);
+                if empty_recycle_bin() {
+                    total += before;
+                }
+            } else {
+                total += clean_dir_contents(path);
             }
-        } else {
-            total += clean_dir_contents(path);
         }
-    }
-    total
+        total
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// 硬件信息
@@ -1354,16 +1376,25 @@ struct GhAuthState {
 }
 
 fn gh_available() -> bool {
-    use std::process::{Command, Stdio};
     use std::os::windows::process::CommandExt;
-    Command::new("gh")
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x0800_0000)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let out = Command::new("gh")
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(o)) => o.status.success(),
+        _ => false,
+    }
 }
 
 /// 查询 gh 登录状态（async，避免阻塞 UI）
@@ -1381,22 +1412,29 @@ async fn gh_auth_state() -> GhAuthState {
         };
     }
     let combined = tauri::async_runtime::spawn_blocking(|| {
-        use std::process::{Command, Stdio};
         use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        match Command::new("gh")
-            .args(["auth", "status"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            Ok(o) => format!(
+        // 用 channel + recv_timeout 实现 3 秒超时，避免 gh 启动慢卡住 UI
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let out = Command::new("gh")
+                .args(["auth", "status"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            let _ = tx.send(out);
+        });
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(o)) => format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&o.stdout),
                 String::from_utf8_lossy(&o.stderr)
             ),
-            Err(_) => String::new(),
+            _ => String::new(),
         }
     })
     .await
@@ -1510,48 +1548,38 @@ async fn gh_setup_git(repo: String) -> Result<(), String> {
     result
 }
 
-/// 通过 winget 安装 GitHub CLI（async）
+/// 退出 GitHub 登录（强制登出所有账号，无交互）
 #[command]
-async fn install_gh() -> Result<String, String> {
+async fn gh_logout() -> Result<String, String> {
+    let installed = tauri::async_runtime::spawn_blocking(gh_available)
+        .await
+        .unwrap_or(false);
+    if !installed {
+        return Err("gh 未安装".to_string());
+    }
     let result = tauri::async_runtime::spawn_blocking(|| {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let out = Command::new("winget")
-            .args([
-                "install",
-                "--id",
-                "GitHub.cli",
-                "-e",
-                "--source",
-                "winget",
-                "--accept-package-agreements",
-                "--accept-source-agreements",
-                "--silent",
-                "--disable-interactivity",
-            ])
+        // --force 无交互登出所有账号；若未登录则返回非零退出码
+        let out = Command::new("gh")
+            .args(["auth", "logout", "--force"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        match out {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                if out.status.success() {
-                    Ok(stdout)
-                } else if stderr.trim().is_empty() {
-                    Err("安装失败".to_string())
-                } else {
-                    Err(stderr)
-                }
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Err("winget 不可用".to_string())
-                } else {
-                    Err(format!("启动 winget 失败: {e}"))
-                }
+            .output()
+            .map_err(|e| format!("执行 gh auth logout 失败: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if out.status.success() {
+            Ok(if stdout.is_empty() { stderr } else { stdout })
+        } else {
+            // gh 在未登录状态下 logout 会返回非零，视为已登出
+            let combined = if stdout.is_empty() { stderr } else { stdout };
+            if combined.to_lowercase().contains("not logged") {
+                Ok("未登录，无需登出".to_string())
+            } else {
+                Err(combined)
             }
         }
     })
@@ -1559,6 +1587,343 @@ async fn install_gh() -> Result<String, String> {
     .map_err(|e| e.to_string())?;
     result
 }
+
+/// PTY 会话状态：保存 master writer 和 child，供前端输入与终止
+struct PtyState {
+    writer: Box<dyn std::io::Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+static PTY: std::sync::Mutex<Option<PtyState>> = std::sync::Mutex::new(None);
+
+/// 启动内置 PTY 运行 gh auth login（web 模式），实时把输出推送到前端
+#[command]
+async fn gh_login_interactive(app: tauri::AppHandle) -> Result<(), String> {
+    // 先关闭已有会话
+    {
+        let mut g = PTY.lock().map_err(|e| format!("PTY 锁失败: {e}"))?;
+        if let Some(mut s) = g.take() {
+            let _ = s.child.kill();
+        }
+    }
+
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("创建 PTY 失败: {e}"))?;
+
+    let mut cmd = portable_pty::CommandBuilder::new("gh");
+    cmd.args([
+        "auth",
+        "login",
+        "--web",
+        "--git-protocol",
+        "https",
+        "--hostname",
+        "github.com",
+    ]);
+    cmd.env("TERM", "xterm-256color");
+    // 显式不继承父进程环境，避免代理等影响
+    cmd.cwd(std::env::temp_dir());
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("启动 gh 失败: {e}"))?;
+    drop(pair.slave); // 关闭 slave 端，避免 EOF 检测失败
+
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("获取 PTY writer 失败: {e}"))?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("克隆 PTY reader 失败: {e}"))?;
+
+    {
+        let mut g = PTY.lock().map_err(|e| format!("PTY 锁失败: {e}"))?;
+        *g = Some(PtyState {
+            writer,
+            child,
+        });
+    }
+
+    // spawn 读取线程：循环读取 PTY 输出并通过事件推送
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        let mut reader = reader;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = app_clone.emit("gh-login-output", s);
+                }
+                Err(_) => break,
+            }
+        }
+        // 通知前端进程已退出
+        let exit_code = {
+            let mut g = match PTY.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if let Some(s) = g.as_mut() {
+                // try_wait 非阻塞，避免在 Mutex 内死锁
+                match s.child.try_wait() {
+                    Ok(Some(st)) => Some(st.exit_code()),
+                    Ok(None) => {
+                        let _ = s.child.kill();
+                        None
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        };
+        let _ = app_clone.emit(
+            "gh-login-output",
+            format!(
+                "\r\n[gh 进程已退出 code={}]\r\n",
+                exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into())
+            ),
+        );
+        // 清理
+        let _ = PTY.lock().map(|mut g| g.take());
+    });
+
+    Ok(())
+}
+
+/// 向 PTY 发送输入（前端可发送 "\r"、字符串等）
+#[command]
+async fn gh_login_input(text: String) -> Result<(), String> {
+    let mut g = PTY.lock().map_err(|e| format!("PTY 锁失败: {e}"))?;
+    if let Some(s) = g.as_mut() {
+        s.writer
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("写入 PTY 失败: {e}"))?;
+        s.writer.flush().ok();
+    }
+    Ok(())
+}
+
+/// 终止当前 PTY 会话
+#[command]
+async fn gh_login_terminate() -> Result<(), String> {
+    let mut g = PTY.lock().map_err(|e| format!("PTY 锁失败: {e}"))?;
+    if let Some(mut s) = g.take() {
+        let _ = s.child.kill();
+    }
+    Ok(())
+}
+
+/// 轮询 gh auth status，等待用户完成登录
+/// 返回最终登录状态：已登录则 Ok(用户名)，未登录则 Err
+#[command]
+async fn gh_wait_login(timeout_secs: u64) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err("等待登录超时".to_string());
+        }
+        let state = tauri::async_runtime::spawn_blocking(|| {
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            match Command::new("gh")
+                .args(["auth", "status"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                Ok(o) => {
+                    let combined = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                    if combined.contains("Logged in to") {
+                        // 提取用户名
+                        combined
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.trim();
+                                l.strip_prefix("Logged in to").and_then(|rest| {
+                                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                                    if parts.len() >= 3 {
+                                        Some(parts[2].trim_matches(|c| c == '(' || c == ')').to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                }
+                Err(_) => String::new(),
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if !state.is_empty() {
+            return Ok(state);
+        }
+        // 在 async 上下文中用 std::thread::sleep 配合 spawn_blocking 不可行
+        // 改用阻塞式 sleep（spawn_blocking 内部可以阻塞）
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// 设置 git 用户名和邮箱（全局配置）
+#[command]
+async fn git_config_user(name: String, email: String) -> Result<(), String> {
+    if name.trim().is_empty() || email.trim().is_empty() {
+        return Err("用户名和邮箱不能为空".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let run = |key: &str, val: &str| -> Result<(), String> {
+            let out = Command::new("git")
+                .args(["config", "--global", key, val])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| format!("执行 git config 失败: {e}"))?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(if err.is_empty() {
+                    format!("git config {} 失败", key)
+                } else {
+                    err
+                });
+            }
+            Ok(())
+        };
+
+        run("user.name", &name)?;
+        run("user.email", &email)?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 读取当前 git 全局配置的 user.name 和 user.email
+#[command]
+async fn git_get_user_config() -> Result<(String, String), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let read = |key: &str| -> String {
+            let out = Command::new("git")
+                .args(["config", "--global", "--get", key])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            match out {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                _ => String::new(),
+            }
+        };
+
+        Ok((read("user.name"), read("user.email")))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 一键同时安装 git 和 gh（winget 串行执行）
+#[command]
+async fn install_git_and_gh() -> Result<String, String> {
+    let result = tauri::async_runtime::spawn_blocking(|| {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let install_one = |id: &str| -> Result<String, String> {
+            let out = Command::new("winget")
+                .args([
+                    "install",
+                    "--id",
+                    id,
+                    "-e",
+                    "--source",
+                    "winget",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                    "--silent",
+                    "--disable-interactivity",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        "winget 不可用，请手动安装".to_string()
+                    } else {
+                        format!("启动 winget 失败: {e}")
+                    }
+                })?;
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if out.status.success() {
+                Ok(stdout)
+            } else {
+                let tail: String = if stderr.trim().len() > stdout.trim().len() {
+                    stderr
+                } else {
+                    stdout
+                }
+                .lines()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+                Err(if tail.trim().is_empty() {
+                    format!("安装 {} 失败", id)
+                } else {
+                    tail
+                })
+            }
+        };
+
+        // 先安装 git，再安装 gh（gh 依赖 git）
+        let git_out = install_one("Git.Git")?;
+        let gh_out = install_one("GitHub.cli")?;
+        Ok(format!("{}\n{}", git_out, gh_out))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    result
+}
+
 
 // ========== 系统优化 ==========
 
@@ -1895,8 +2260,15 @@ pub fn run() {
             pick_folder,
             gh_auth_state,
             gh_login_web,
+            gh_logout,
+            gh_login_interactive,
+            gh_login_input,
+            gh_login_terminate,
+            gh_wait_login,
             gh_setup_git,
-            install_gh,
+            install_git_and_gh,
+            git_config_user,
+            git_get_user_config,
             is_admin,
             relaunch_as_admin,
             optimize_states,
