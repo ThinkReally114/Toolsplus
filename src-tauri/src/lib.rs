@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tauri::{command, Emitter};
+use tauri::command;
 
 /// 扫描结果项
 #[derive(serde::Serialize)]
@@ -297,65 +297,158 @@ fn get_hardware_info() -> HardwareInfo {
     }
 }
 
-/// 通过 PowerShell 查询主板信息
+/// 通过 WMI COM API 查询主板信息（原生，无需 PowerShell）
 fn query_motherboard() -> String {
-    let script = "Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue | ForEach-Object { \"$($_.Manufacturer)|$($_.Product)\" }";
-    let output = run_powershell(script, std::time::Duration::from_secs(10));
-    let raw = parse_powershell_output(output);
-    let line = raw.lines().next().unwrap_or("").trim().to_string();
-    let (mfg, product) = match line.split_once('|') {
-        Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
-        None => (String::new(), String::new()),
-    };
-
-    if mfg.is_empty() && product.is_empty() {
-        "未知".to_string()
-    } else if mfg.is_empty() {
-        product
-    } else if product.is_empty() {
-        mfg
-    } else {
-        format!("{} {}", mfg, product)
-    }
+    use std::collections::HashMap;
+    use std::time::Duration;
+    let result = std::thread::scope(|s| {
+        s.spawn(|| {
+            let wmi = wmi::WMIConnection::with_namespace_path("ROOT\\CIMV2", wmi::COMLibrary::new().ok()?)
+                .ok()?;
+            let results: Vec<HashMap<String, wmi::Variant>> = wmi
+                .raw_query("SELECT Manufacturer, Product FROM Win32_BaseBoard")
+                .ok()?;
+            let row = results.first()?;
+            let mfg = variant_to_string(row.get("Manufacturer"));
+            let product = variant_to_string(row.get("Product"));
+            Some(if mfg.is_empty() && product.is_empty() {
+                "未知".to_string()
+            } else if mfg.is_empty() {
+                product
+            } else if product.is_empty() {
+                mfg
+            } else {
+                format!("{} {}", mfg, product)
+            })
+        })
+        .join()
+        .ok()
+        .flatten()
+    });
+    result.unwrap_or_else(|| {
+        let script = "Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue | ForEach-Object { \"$($_.Manufacturer)|$($_.Product)\" }";
+        let output = run_powershell(script, Duration::from_secs(10));
+        let raw = parse_powershell_output(output);
+        let line = raw.lines().next().unwrap_or("").trim().to_string();
+        let (mfg, product) = match line.split_once('|') {
+            Some((a, b)) => (a.trim().to_string(), b.trim().to_string()),
+            None => (String::new(), String::new()),
+        };
+        if mfg.is_empty() && product.is_empty() {
+            "未知".to_string()
+        } else if mfg.is_empty() {
+            product
+        } else if product.is_empty() {
+            mfg
+        } else {
+            format!("{} {}", mfg, product)
+        }
+    })
 }
 
-/// 通过 PowerShell 查询显卡信息（支持多显卡）
+/// 通过 WMI COM API 查询显卡信息（原生，无需 PowerShell）
 fn query_gpu() -> String {
-    let output = run_powershell(
-        "Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name } | Select-Object -ExpandProperty Name",
-        std::time::Duration::from_secs(10),
-    );
-    let raw = parse_powershell_output(output);
-    let names: Vec<String> = raw
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if names.is_empty() {
-        "未知".to_string()
-    } else {
-        names.join(" + ")
-    }
+    use std::collections::HashMap;
+    use std::time::Duration;
+    let result = std::thread::scope(|s| {
+        s.spawn(|| {
+            let wmi = wmi::WMIConnection::with_namespace_path("ROOT\\CIMV2", wmi::COMLibrary::new().ok()?)
+                .ok()?;
+            let results: Vec<HashMap<String, wmi::Variant>> = wmi
+                .raw_query("SELECT Name FROM Win32_VideoController WHERE Name IS NOT NULL")
+                .ok()?;
+            let names: Vec<String> = results
+                .iter()
+                .filter_map(|row| {
+                    let n = variant_to_string(row.get("Name"));
+                    if n.is_empty() { None } else { Some(n) }
+                })
+                .collect();
+            Some(if names.is_empty() {
+                "未知".to_string()
+            } else {
+                names.join(" + ")
+            })
+        })
+        .join()
+        .ok()
+        .flatten()
+    });
+    result.unwrap_or_else(|| {
+        let output = run_powershell(
+            "Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name } | Select-Object -ExpandProperty Name",
+            Duration::from_secs(10),
+        );
+        let raw = parse_powershell_output(output);
+        let names: Vec<String> = raw
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if names.is_empty() {
+            "未知".to_string()
+        } else {
+            names.join(" + ")
+        }
+    })
 }
 
-/// 查询显卡详情：显存总量、驱动版本
+/// 查询显卡详情：显存总量（DXGI 原生 API）、驱动版本（WMI）
 fn query_gpu_detail() -> (String, String) {
-    let script = "Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name } | Select-Object -First 1 | ForEach-Object { \"{0}|{1}\" -f $_.AdapterRAM, $_.DriverVersion }";
-    let output = run_powershell(script, std::time::Duration::from_secs(10));
-    let raw = parse_powershell_output(output);
-    let line = raw.lines().next().unwrap_or("").trim().to_string();
-    let mut parts = line.split('|');
-    let vram_raw = parts.next().unwrap_or("").trim().to_string();
-    let driver = parts.next().unwrap_or("").trim().to_string();
+    use std::collections::HashMap;
+    use std::time::Duration;
     let vram = if let Some(bytes) = query_gpu_vram_dxgi() {
         fmt_bytes(bytes)
     } else {
-        vram_raw
-            .parse::<u64>()
-            .map(fmt_bytes)
-            .unwrap_or_else(|_| "未知".to_string())
+        "未知".to_string()
     };
-    (vram, if driver.is_empty() { "未知".to_string() } else { driver })
+
+    let driver = {
+        let result = std::thread::scope(|s| {
+            s.spawn(|| {
+                let wmi = wmi::WMIConnection::with_namespace_path("ROOT\\CIMV2", wmi::COMLibrary::new().ok()?)
+                    .ok()?;
+                let results: Vec<HashMap<String, wmi::Variant>> = wmi
+                    .raw_query("SELECT DriverVersion FROM Win32_VideoController WHERE Name IS NOT NULL")
+                    .ok()?;
+                let row = results.first()?;
+                let d = variant_to_string(row.get("DriverVersion"));
+                Some(if d.is_empty() { "未知".to_string() } else { d })
+            })
+            .join()
+            .ok()
+            .flatten()
+        });
+        result.unwrap_or_else(|| {
+            let script = "Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name } | Select-Object -First 1 -ExpandProperty DriverVersion";
+            let output = run_powershell(script, Duration::from_secs(10));
+            let raw = parse_powershell_output(output);
+            let d = raw.trim().to_string();
+            if d.is_empty() { "未知".to_string() } else { d }
+        })
+    };
+
+    (vram, driver)
+}
+
+/// 将 WMI Variant 值转为 String
+fn variant_to_string(v: Option<&wmi::Variant>) -> String {
+    use wmi::Variant;
+    match v {
+        Some(Variant::String(s)) => s.trim().to_string(),
+        Some(Variant::I1(n)) => n.to_string(),
+        Some(Variant::I2(n)) => n.to_string(),
+        Some(Variant::I4(n)) => n.to_string(),
+        Some(Variant::I8(n)) => n.to_string(),
+        Some(Variant::UI1(n)) => n.to_string(),
+        Some(Variant::UI2(n)) => n.to_string(),
+        Some(Variant::UI4(n)) => n.to_string(),
+        Some(Variant::UI8(n)) => n.to_string(),
+        Some(Variant::R4(n)) => n.to_string(),
+        Some(Variant::R8(n)) => n.to_string(),
+        Some(Variant::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// 通过 DXGI 枚举显卡获取真实显存（WMI AdapterRAM 为 32 位字段，4GB 以上会溢出）
@@ -384,25 +477,61 @@ fn query_gpu_vram_dxgi() -> Option<u64> {
     None
 }
 
-/// 查询内存条信息：速率、品牌
+/// 查询内存条信息：速率、品牌（原生 WMI COM API）
 fn query_ram_detail() -> (String, String) {
-    let script = "Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { \"{0}|{1}\" -f $_.Speed, $_.Manufacturer }";
-    let output = run_powershell(script, std::time::Duration::from_secs(10));
-    let raw = parse_powershell_output(output);
-    let line = raw.lines().next().unwrap_or("").trim().to_string();
-    let mut parts = line.split('|');
-    let speed_raw = parts.next().unwrap_or("").trim().to_string();
-    let mfg = parts.next().unwrap_or("").trim().to_string();
-    let speed = speed_raw
-        .parse::<u64>()
-        .map(|s| format!("{} MHz", s))
-        .unwrap_or_else(|_| if speed_raw.is_empty() { "未知".to_string() } else { speed_raw });
-    let brand = if mfg.is_empty() { "未知".to_string() } else { mfg.trim_matches(char::is_control).trim().to_string() };
-    (speed, brand)
+    use std::collections::HashMap;
+    use std::time::Duration;
+    let result = std::thread::scope(|s| {
+        s.spawn(|| {
+            let wmi = wmi::WMIConnection::with_namespace_path("ROOT\\CIMV2", wmi::COMLibrary::new().ok()?)
+                .ok()?;
+            let results: Vec<HashMap<String, wmi::Variant>> = wmi
+                .raw_query("SELECT Speed, Manufacturer FROM Win32_PhysicalMemory")
+                .ok()?;
+            let row = results.first()?;
+            let speed_raw = variant_to_string(row.get("Speed"));
+            let mfg = variant_to_string(row.get("Manufacturer"));
+            let speed = speed_raw
+                .parse::<u64>()
+                .map(|s| format!("{} MHz", s))
+                .unwrap_or_else(|_| {
+                    if speed_raw.is_empty() {
+                        "未知".to_string()
+                    } else {
+                        speed_raw.clone()
+                    }
+                });
+            let brand = if mfg.is_empty() {
+                "未知".to_string()
+            } else {
+                mfg.trim_matches(char::is_control).trim().to_string()
+            };
+            Some((speed, brand))
+        })
+        .join()
+        .ok()
+        .flatten()
+    });
+    result.unwrap_or_else(|| {
+        let script = "Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { \"{0}|{1}\" -f $_.Speed, $_.Manufacturer }";
+        let output = run_powershell(script, Duration::from_secs(10));
+        let raw = parse_powershell_output(output);
+        let line = raw.lines().next().unwrap_or("").trim().to_string();
+        let mut parts = line.split('|');
+        let speed_raw = parts.next().unwrap_or("").trim().to_string();
+        let mfg = parts.next().unwrap_or("").trim().to_string();
+        let speed = speed_raw
+            .parse::<u64>()
+            .map(|s| format!("{} MHz", s))
+            .unwrap_or_else(|_| if speed_raw.is_empty() { "未知".to_string() } else { speed_raw });
+        let brand = if mfg.is_empty() { "未知".to_string() } else { mfg.trim_matches(char::is_control).trim().to_string() };
+        (speed, brand)
+    })
 }
 
-/// 查询磁盘信息
+/// 查询磁盘信息（sysinfo 主路径 + WMI 原生 API 补充型号/接口）
 fn query_disks() -> Vec<DiskInfo> {
+    use std::collections::HashMap;
     use sysinfo::Disks;
     let mut result = Vec::new();
     let disks = Disks::new_with_refreshed_list();
@@ -420,28 +549,67 @@ fn query_disks() -> Vec<DiskInfo> {
         });
     }
     if result.is_empty() {
-        let script = "Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue | ForEach-Object { \"{0}|{1}|{2}\" -f $_.Model, $_.Size, $_.InterfaceType }";
-        let output = run_powershell(script, std::time::Duration::from_secs(10));
-        let raw = parse_powershell_output(output);
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            let mut parts = line.split('|');
-            let model = parts.next().unwrap_or("").trim().to_string();
-            let size_raw = parts.next().unwrap_or("").trim().to_string();
-            let iface = parts.next().unwrap_or("").trim().to_string();
-            let total = size_raw.parse::<u64>().map(fmt_bytes).unwrap_or_else(|_| "未知".to_string());
-            result.push(DiskInfo {
-                name: model.clone(),
-                model,
-                total,
-                free: "—".to_string(),
-                disk_type: String::new(),
-                interface: iface,
-            });
+        let mut result_ext: Vec<DiskInfo> = Vec::new();
+        let wmi_list = std::thread::scope(|s| {
+            s.spawn(|| {
+                let wmi = wmi::WMIConnection::with_namespace_path("ROOT\\CIMV2", wmi::COMLibrary::new().ok()?)
+                    .ok()?;
+                let results: Vec<HashMap<String, wmi::Variant>> = wmi
+                    .raw_query("SELECT Model, Size, InterfaceType FROM Win32_DiskDrive")
+                    .ok()?;
+                let mut list = Vec::new();
+                for row in results {
+                    let model = variant_to_string(row.get("Model"));
+                    let size_raw = variant_to_string(row.get("Size"));
+                    let iface = variant_to_string(row.get("InterfaceType"));
+                    let total = size_raw
+                        .parse::<u64>()
+                        .map(fmt_bytes)
+                        .unwrap_or_else(|_| "未知".to_string());
+                    list.push(DiskInfo {
+                        name: model.clone(),
+                        model,
+                        total,
+                        free: "—".to_string(),
+                        disk_type: String::new(),
+                        interface: iface,
+                    });
+                }
+                Some(list)
+            })
+            .join()
+            .ok()
+            .flatten()
+        });
+        if let Some(list) = wmi_list {
+            result_ext.extend(list);
         }
+        if result_ext.is_empty() {
+            let script = "Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue | ForEach-Object { \"{0}|{1}|{2}\" -f $_.Model, $_.Size, $_.InterfaceType }";
+            let output = run_powershell(script, std::time::Duration::from_secs(10));
+            let raw = parse_powershell_output(output);
+            for line in raw.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                let mut parts = line.split('|');
+                let model = parts.next().unwrap_or("").trim().to_string();
+                let size_raw = parts.next().unwrap_or("").trim().to_string();
+                let iface = parts.next().unwrap_or("").trim().to_string();
+                let total = size_raw.parse::<u64>().map(fmt_bytes).unwrap_or_else(|_| "未知".to_string());
+                result_ext.push(DiskInfo {
+                    name: model.clone(),
+                    model,
+                    total,
+                    free: "—".to_string(),
+                    disk_type: String::new(),
+                    interface: iface,
+                });
+            }
+        }
+        result_ext
+    } else {
+        result
     }
-    result
 }
 
 /// 带超时执行 PowerShell 命令，避免查询卡死
@@ -1450,14 +1618,18 @@ async fn gh_auth_state() -> GhAuthState {
     let logged_in = combined.contains("Logged in to")
         || combined.contains("Logged in to github.com")
         || combined.to_lowercase().contains("token:");
-    let user = combined
+    // 解析用户名：支持 "Logged in to github.com account USERNAME" 和 "account: USERNAME" 两种格式
+    let mut user = combined
         .lines()
         .find_map(|l| {
             let l = l.trim();
             l.strip_prefix("Logged in to")
                 .and_then(|rest| {
                     let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if parts.len() >= 3 {
+                    // "Logged in to github.com account USERNAME (keyring)"
+                    if let Some(idx) = parts.iter().position(|s| *s == "account") {
+                        parts.get(idx + 1).map(|s| s.trim_matches(|c| c == '(' || c == ')').to_string())
+                    } else if parts.len() >= 3 {
                         Some(parts[2].trim_matches(|c| c == '(' || c == ')').to_string())
                     } else {
                         None
@@ -1473,6 +1645,34 @@ async fn gh_auth_state() -> GhAuthState {
                 .and_then(|rest| rest.split_whitespace().next().map(|s| s.to_string()))
         })
         .unwrap_or_default();
+    // 如果已登录但 user 为空，用 gh api user 兜底获取
+    if logged_in && user.is_empty() {
+        user = tauri::async_runtime::spawn_blocking(|| {
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+            use std::sync::mpsc;
+            use std::time::Duration;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let out = Command::new("gh")
+                    .args(["api", "user", "--jq", ".login"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+                let _ = tx.send(out);
+            });
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(o)) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                }
+                _ => String::new(),
+            }
+        })
+        .await
+        .unwrap_or_default();
+    }
     GhAuthState {
         gh_installed: true,
         logged_in,
@@ -1561,9 +1761,9 @@ async fn gh_logout() -> Result<String, String> {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // --force 无交互登出所有账号；若未登录则返回非零退出码
+        // gh auth logout 不支持 --force，用 --hostname 指定 host 非交互登出
         let out = Command::new("gh")
-            .args(["auth", "logout", "--force"])
+            .args(["auth", "logout", "--hostname", "github.com"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
@@ -1588,149 +1788,28 @@ async fn gh_logout() -> Result<String, String> {
     result
 }
 
-/// PTY 会话状态：保存 master writer 和 child，供前端输入与终止
-struct PtyState {
-    writer: Box<dyn std::io::Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-}
-
-static PTY: std::sync::Mutex<Option<PtyState>> = std::sync::Mutex::new(None);
-
-/// 启动内置 PTY 运行 gh auth login（web 模式），实时把输出推送到前端
+/// 启动新 PowerShell 窗口运行 gh auth login（交互式登录必须在真实终端中完成）
 #[command]
-async fn gh_login_interactive(app: tauri::AppHandle) -> Result<(), String> {
-    // 先关闭已有会话
-    {
-        let mut g = PTY.lock().map_err(|e| format!("PTY 锁失败: {e}"))?;
-        if let Some(mut s) = g.take() {
-            let _ = s.child.kill();
-        }
-    }
-
-    let pty_system = portable_pty::native_pty_system();
-    let pair = pty_system
-        .openpty(portable_pty::PtySize {
-            rows: 24,
-            cols: 100,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("创建 PTY 失败: {e}"))?;
-
-    let mut cmd = portable_pty::CommandBuilder::new("gh");
-    cmd.args([
-        "auth",
-        "login",
-        "--web",
-        "--git-protocol",
-        "https",
-        "--hostname",
-        "github.com",
-    ]);
-    cmd.env("TERM", "xterm-256color");
-    // 显式不继承父进程环境，避免代理等影响
-    cmd.cwd(std::env::temp_dir());
-
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("启动 gh 失败: {e}"))?;
-    drop(pair.slave); // 关闭 slave 端，避免 EOF 检测失败
-
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| format!("获取 PTY writer 失败: {e}"))?;
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("克隆 PTY reader 失败: {e}"))?;
-
-    {
-        let mut g = PTY.lock().map_err(|e| format!("PTY 锁失败: {e}"))?;
-        *g = Some(PtyState {
-            writer,
-            child,
-        });
-    }
-
-    // spawn 读取线程：循环读取 PTY 输出并通过事件推送
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = [0u8; 4096];
-        let mut reader = reader;
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app_clone.emit("gh-login-output", s);
-                }
-                Err(_) => break,
-            }
-        }
-        // 通知前端进程已退出
-        let exit_code = {
-            let mut g = match PTY.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            if let Some(s) = g.as_mut() {
-                // try_wait 非阻塞，避免在 Mutex 内死锁
-                match s.child.try_wait() {
-                    Ok(Some(st)) => Some(st.exit_code()),
-                    Ok(None) => {
-                        let _ = s.child.kill();
-                        None
-                    }
-                    Err(_) => None,
-                }
-            } else {
-                None
-            }
-        };
-        let _ = app_clone.emit(
-            "gh-login-output",
-            format!(
-                "\r\n[gh 进程已退出 code={}]\r\n",
-                exit_code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "?".into())
-            ),
-        );
-        // 清理
-        let _ = PTY.lock().map(|mut g| g.take());
-    });
-
-    Ok(())
+async fn gh_login_interactive() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        // 启动新 PowerShell 窗口运行 gh auth login
+        // 限制窗口大小为 100x30，避免默认窗口过大
+        // 先 gh auth logout 清除旧 token，避免旧登录状态干扰 gh_wait_login 轮询
+        let script = "mode con: cols=100 lines=30; $Host.UI.RawUI.WindowTitle = 'GitHub CLI 登录'; Write-Host '===== GitHub CLI 登录 =====' -ForegroundColor Cyan; Write-Host '正在清除旧的登录状态...' -ForegroundColor Yellow; gh auth logout --hostname github.com 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host '（无旧登录或清除失败，可忽略）' -ForegroundColor DarkGray }; Write-Host ''; Write-Host '请在下方交互式完成 GitHub 授权流程' -ForegroundColor Yellow; Write-Host ''; gh auth login; Write-Host ''; Write-Host '登录流程结束，请关闭此窗口返回 ToolsPlus' -ForegroundColor Green; Read-Host '按回车键关闭'";
+        let _child = Command::new("powershell")
+            .args(["-NoExit", "-NoProfile", "-Command", script])
+            .creation_flags(0)
+            .spawn()
+            .map_err(|e| format!("启动登录窗口失败: {e}"))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-/// 向 PTY 发送输入（前端可发送 "\r"、字符串等）
-#[command]
-async fn gh_login_input(text: String) -> Result<(), String> {
-    let mut g = PTY.lock().map_err(|e| format!("PTY 锁失败: {e}"))?;
-    if let Some(s) = g.as_mut() {
-        s.writer
-            .write_all(text.as_bytes())
-            .map_err(|e| format!("写入 PTY 失败: {e}"))?;
-        s.writer.flush().ok();
-    }
-    Ok(())
-}
-
-/// 终止当前 PTY 会话
-#[command]
-async fn gh_login_terminate() -> Result<(), String> {
-    let mut g = PTY.lock().map_err(|e| format!("PTY 锁失败: {e}"))?;
-    if let Some(mut s) = g.take() {
-        let _ = s.child.kill();
-    }
-    Ok(())
-}
-
-/// 轮询 gh auth status，等待用户完成登录
-/// 返回最终登录状态：已登录则 Ok(用户名)，未登录则 Err
+/// 轮询 gh api user 获取登录用户名，等待用户完成登录
 #[command]
 async fn gh_wait_login(timeout_secs: u64) -> Result<String, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
@@ -1738,54 +1817,31 @@ async fn gh_wait_login(timeout_secs: u64) -> Result<String, String> {
         if std::time::Instant::now() > deadline {
             return Err("等待登录超时".to_string());
         }
-        let state = tauri::async_runtime::spawn_blocking(|| {
+        let user = tauri::async_runtime::spawn_blocking(|| {
             use std::os::windows::process::CommandExt;
             use std::process::{Command, Stdio};
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            // 用 gh api user --jq .login 直接获取登录用户名
+            // 未登录时会失败（非零退出码），已登录时返回纯用户名
             match Command::new("gh")
-                .args(["auth", "status"])
+                .args(["api", "user", "--jq", ".login"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
             {
-                Ok(o) => {
-                    let combined = format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(&o.stdout),
-                        String::from_utf8_lossy(&o.stderr)
-                    );
-                    if combined.contains("Logged in to") {
-                        // 提取用户名
-                        combined
-                            .lines()
-                            .find_map(|l| {
-                                let l = l.trim();
-                                l.strip_prefix("Logged in to").and_then(|rest| {
-                                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                                    if parts.len() >= 3 {
-                                        Some(parts[2].trim_matches(|c| c == '(' || c == ')').to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
                 }
-                Err(_) => String::new(),
+                _ => String::new(),
             }
         })
         .await
         .map_err(|e| e.to_string())?;
 
-        if !state.is_empty() {
-            return Ok(state);
+        if !user.is_empty() {
+            return Ok(user);
         }
-        // 在 async 上下文中用 std::thread::sleep 配合 spawn_blocking 不可行
-        // 改用阻塞式 sleep（spawn_blocking 内部可以阻塞）
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 }
@@ -2262,8 +2318,6 @@ pub fn run() {
             gh_login_web,
             gh_logout,
             gh_login_interactive,
-            gh_login_input,
-            gh_login_terminate,
             gh_wait_login,
             gh_setup_git,
             install_git_and_gh,

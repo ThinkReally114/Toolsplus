@@ -403,10 +403,10 @@ body,
 #app {
   height: 100%;
   margin: 0;
-}
-
-#app {
   font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 .app-root {

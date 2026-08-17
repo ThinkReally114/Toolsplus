@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { inject, ref, computed, onMounted, onBeforeUnmount, nextTick } from "vue";
+import { inject, ref, computed, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import PageShell from "@/components/PageShell.vue";
 import WinTextBlock from "@winui/components/WinTextBlock.vue";
 import WinButton from "@winui/components/WinButton.vue";
@@ -10,6 +9,7 @@ import WinHyperlinkButton from "@winui/components/WinHyperlinkButton.vue";
 import WinSelectorBar from "@winui/components/WinSelectorBar.vue";
 import WinContentDialog from "@winui/components/WinContentDialog.vue";
 import WinProgressRing from "@winui/components/WinProgressRing.vue";
+import WinCheckBox from "@winui/components/WinCheckBox.vue";
 import AppIcon from "@/components/AppIcon.vue";
 import { i18nKey, type I18n } from "@winui/components/i18n/index";
 
@@ -65,6 +65,11 @@ const loading = ref(false);
 const busy = ref(false);
 const commitMsg = ref("");
 const notice = ref("");
+const commitPushDialog = ref(false);
+const commitPushMsg = ref("");
+const commitPushBusy = ref(false);
+const commitPushError = ref("");
+const commitPushOnly = ref(false);
 
 const stagedFiles = computed(
   () => status.value?.files.filter((f) => f.staged) ?? []
@@ -76,10 +81,13 @@ const untrackedFiles = computed(
   () => status.value?.files.filter((f) => f.x === "?") ?? []
 );
 const canCommit = computed(
+  () => stagedFiles.value.length > 0 && !busy.value
+);
+const canCommitPush = computed(
   () =>
     stagedFiles.value.length > 0 &&
-    commitMsg.value.trim().length > 0 &&
-    !busy.value
+    commitPushMsg.value.trim().length > 0 &&
+    !commitPushBusy.value
 );
 
 const cloneUrl = ref("");
@@ -103,6 +111,7 @@ function onGitTabChanged(sender: any) {
 
 // 登录流程状态
 const needLoginDialog = ref(false);
+const logoutConfirmDialog = ref(false);
 const loginWizardOpen = ref(false);
 const loginStep = ref(0);
 const loginLogs = ref<string[]>([]);
@@ -111,56 +120,8 @@ const loginUserName = ref("");
 const loginUserEmail = ref("");
 const logoutBusy = ref(false);
 
-// 集成终端面板
-const terminalOutput = ref("");
-const terminalInput = ref("");
-const terminalExited = ref(false);
-const terminalRef = ref<HTMLDivElement | null>(null);
-let ptyUnlisten: UnlistenFn | null = null;
-
 function appendLog(line: string) {
   loginLogs.value.push(`[${new Date().toLocaleTimeString()}] ${line}`);
-}
-
-function appendTerminal(text: string) {
-  terminalOutput.value += text;
-  // 检测进程退出标记
-  if (text.includes("[gh 进程已退出")) {
-    terminalExited.value = true;
-  }
-  nextTick(() => {
-    const el = terminalRef.value;
-    if (el) el.scrollTop = el.scrollHeight;
-  });
-}
-
-async function sendTerminalInput() {
-  const text = terminalInput.value;
-  if (!text && !terminalExited.value) return;
-  // 进程已退出时按回车也只发送换行
-  const payload = text + "\r";
-  try {
-    await invoke("gh_login_input", { text: payload });
-    terminalInput.value = "";
-  } catch (e) {
-    loginError.value = String(e);
-  }
-}
-
-async function sendEnter() {
-  try {
-    await invoke("gh_login_input", { text: "\r" });
-  } catch (e) {
-    loginError.value = String(e);
-  }
-}
-
-async function terminatePty() {
-  try {
-    await invoke("gh_login_terminate");
-  } catch {
-    // ignore
-  }
 }
 
 async function browseFolder() {
@@ -363,6 +324,48 @@ async function commit() {
   }
 }
 
+function openCommitPushDialog() {
+  commitPushMsg.value = commitMsg.value || "";
+  commitPushError.value = "";
+  commitPushOnly.value = false;
+  commitPushDialog.value = true;
+}
+
+async function confirmCommitPush() {
+  if (!commitPushMsg.value.trim()) {
+    commitPushError.value = i18n.t("git.commitMsgEmpty");
+    return;
+  }
+  commitPushBusy.value = true;
+  commitPushError.value = "";
+  try {
+    await invoke("git_commit", {
+      repo: repoPath.value,
+      message: commitPushMsg.value,
+      branch: selectedBranch.value || undefined,
+    });
+    commitMsg.value = "";
+    await refreshAll();
+    await refreshBranches();
+    if (commitPushOnly.value) {
+      notice.value = "ok";
+      commitPushDialog.value = false;
+    } else {
+      await invoke("git_push", {
+        repo: repoPath.value,
+        branch: selectedBranch.value || undefined,
+      });
+      notice.value = "pushed";
+      await refreshAll();
+      commitPushDialog.value = false;
+    }
+  } catch (e) {
+    commitPushError.value = String(e);
+  } finally {
+    commitPushBusy.value = false;
+  }
+}
+
 async function push() {
   busy.value = true;
   repoError.value = "";
@@ -411,12 +414,20 @@ function openGhSite() {
 }
 
 async function logoutGithub() {
+  // 先弹二次确认对话框
+  logoutConfirmDialog.value = true;
+}
+
+async function confirmLogout() {
+  logoutConfirmDialog.value = false;
   logoutBusy.value = true;
   notice.value = "";
   try {
     await invoke<string>("gh_logout");
     await refreshAuth();
     notice.value = "loggedOut";
+    // 退出后弹出引导对话框：登录或跳过
+    needLoginDialog.value = true;
   } catch (e) {
     repoError.value = String(e);
   } finally {
@@ -432,23 +443,6 @@ async function startLoginWizard() {
   loginError.value = "";
   loginUserName.value = "";
   loginUserEmail.value = "";
-  terminalOutput.value = "";
-  terminalInput.value = "";
-  terminalExited.value = false;
-
-  // 启动事件监听
-  if (ptyUnlisten) {
-    ptyUnlisten();
-    ptyUnlisten = null;
-  }
-  try {
-    ptyUnlisten = await listen<string>("gh-login-output", (e) => {
-      appendTerminal(e.payload);
-    });
-  } catch (e) {
-    loginError.value = String(e);
-    return;
-  }
 
   appendLog(i18n.t("git.wizStart"));
   appendLog(i18n.t("git.wizStep1"));
@@ -458,59 +452,36 @@ async function startLoginWizard() {
     appendLog(i18n.t("git.wizLoginWindowOpened"));
     loginStep.value = 2;
     appendLog(i18n.t("git.wizWaitingLogin"));
-    // 等待终端退出，由 PTY 输出事件触发
-    await waitForTerminalExit(300);
-    // 退出后检测登录状态
-    await refreshAuth();
-    if (authState.value?.logged_in) {
-      const user = authState.value.user || "unknown";
-      appendLog(i18n.t("git.wizLoginSuccess", { user }));
-      loginStep.value = 3;
-      appendLog(i18n.t("git.wizStep3"));
-      if (repoPath.value) {
-        try {
-          await invoke("gh_setup_git", { repo: repoPath.value });
-          appendLog(i18n.t("git.wizSetupGitOk"));
-        } catch (e) {
-          appendLog(i18n.t("git.wizSetupGitFail", { err: String(e) }));
-        }
-      } else {
-        appendLog(i18n.t("git.wizSetupGitSkip"));
-      }
-      loginStep.value = 4;
-      appendLog(i18n.t("git.wizStep4"));
+    const user = await invoke<string>("gh_wait_login", { timeoutSecs: 300 });
+    if (!user) {
+      throw new Error("未检测到登录用户名");
+    }
+    appendLog(i18n.t("git.wizLoginSuccess", { user }));
+    loginStep.value = 3;
+    appendLog(i18n.t("git.wizStep3"));
+    if (repoPath.value) {
       try {
-        const cfg = await invoke<[string, string]>("git_get_user_config");
-        loginUserName.value = cfg[0] || "";
-        loginUserEmail.value = cfg[1] || "";
-      } catch {
-        // ignore
+        await invoke("gh_setup_git", { repo: repoPath.value });
+        appendLog(i18n.t("git.wizSetupGitOk"));
+      } catch (e) {
+        appendLog(i18n.t("git.wizSetupGitFail", { err: String(e) }));
       }
     } else {
-      appendLog(i18n.t("git.wizError", { err: "未检测到登录状态" }));
+      appendLog(i18n.t("git.wizSetupGitSkip"));
+    }
+    loginStep.value = 4;
+    appendLog(i18n.t("git.wizStep4"));
+    try {
+      const cfg = await invoke<[string, string]>("git_get_user_config");
+      loginUserName.value = cfg[0] || "";
+      loginUserEmail.value = cfg[1] || "";
+    } catch {
+      // ignore
     }
   } catch (e) {
     loginError.value = String(e);
     appendLog(i18n.t("git.wizError", { err: String(e) }));
   }
-}
-
-function waitForTerminalExit(timeoutSecs: number): Promise<void> {
-  const start = Date.now();
-  return new Promise((resolve) => {
-    const tick = () => {
-      if (terminalExited.value) {
-        resolve();
-        return;
-      }
-      if (Date.now() - start > timeoutSecs * 1000) {
-        resolve();
-        return;
-      }
-      setTimeout(tick, 500);
-    };
-    tick();
-  });
 }
 
 async function saveGitConfig() {
@@ -539,14 +510,6 @@ async function saveGitConfig() {
 
 function closeLoginWizard() {
   loginWizardOpen.value = false;
-  // 关闭时终止未完成的 PTY 会话
-  if (!terminalExited.value) {
-    terminatePty();
-  }
-  if (ptyUnlisten) {
-    ptyUnlisten();
-    ptyUnlisten = null;
-  }
   refreshAuth();
 }
 
@@ -567,16 +530,6 @@ onMounted(async () => {
     console.error(e);
   } finally {
     checking.value = false;
-  }
-});
-
-onBeforeUnmount(() => {
-  if (ptyUnlisten) {
-    ptyUnlisten();
-    ptyUnlisten = null;
-  }
-  if (!terminalExited.value) {
-    terminatePty();
   }
 });
 </script>
@@ -654,6 +607,37 @@ onBeforeUnmount(() => {
           @click="refreshAll"
           :IsEnabled="!loading && !repoError"
         />
+        <div class="git-account-area">
+          <WinTextBlock
+            v-if="authState?.logged_in && authState?.user"
+            :Text="i18n.t('git.loggedAs', { user: authState.user, host: authState.host || 'github.com' })"
+            Style="font-size:12px"
+            Foreground="secondary"
+          />
+          <WinTextBlock
+            v-else
+            :Text="i18n.t('git.notLoggedIn')"
+            Style="font-size:12px"
+            Foreground="secondary"
+          />
+          <WinButton
+            :IsEnabled="!busy && !logoutBusy"
+            @click="startLoginWizard"
+            :Title="i18n.t('git.switchAccount')"
+            Style="padding:4px;min-height:28px"
+          >
+            <AppIcon name="switchAccount" :size="16" />
+          </WinButton>
+          <WinButton
+            v-if="authState?.logged_in"
+            :IsEnabled="!busy && !logoutBusy"
+            @click="logoutGithub"
+            :Title="logoutBusy ? i18n.t('git.loggingOut') : i18n.t('git.logout')"
+            Style="padding:4px;min-height:28px"
+          >
+            <AppIcon name="logout" :size="16" />
+          </WinButton>
+        </div>
       </div>
 
       <div class="git-clone-box">
@@ -679,21 +663,6 @@ onBeforeUnmount(() => {
           Style="AccentButtonStyle"
           @click="cloneRepo"
           :IsEnabled="!cloning && !!cloneUrl && !!cloneTarget"
-        />
-      </div>
-
-      <div class="git-commit-box">
-        <WinTextBox
-          :Text="commitMsg"
-          :PlaceholderText="i18n.t('git.commitPlaceholder')"
-          @update:Text="(v: string) => (commitMsg = v)"
-          Style="flex:1;min-width:200px"
-        />
-        <WinButton
-          :Content="i18n.t('git.commit')"
-          Style="AccentButtonStyle"
-          @click="commit"
-          :IsEnabled="canCommit"
         />
       </div>
 
@@ -731,12 +700,6 @@ onBeforeUnmount(() => {
           <div class="git-branch-row">
             <AppIcon name="git" :size="20" />
             <WinTextBlock :Text="status.branch || '—'" Style="font-size:16px;font-weight:600" />
-            <WinTextBlock
-              v-if="authState?.logged_in && authState?.user"
-              :Text="i18n.t('git.loggedAs', { user: authState.user, host: authState.host || 'github.com' })"
-              Style="font-size:12px"
-              Foreground="secondary"
-            />
             <WinTextBlock
               v-if="status.ahead > 0"
               :Text="i18n.t('git.ahead', { n: status.ahead })"
@@ -833,27 +796,14 @@ onBeforeUnmount(() => {
 
           <div class="git-remote-actions">
             <WinButton
-              :Content="i18n.t('git.push')"
+              :Content="i18n.t('git.commitAndPush')"
               Style="AccentButtonStyle"
+              @click="openCommitPushDialog"
+              :IsEnabled="!busy && stagedFiles.length > 0"
+            />
+            <WinButton
+              :Content="i18n.t('git.push')"
               @click="push"
-              :IsEnabled="!busy"
-            />
-            <WinButton
-              v-if="authState?.logged_in"
-              :Content="logoutBusy ? i18n.t('git.loggingOut') : i18n.t('git.switchAccount')"
-              @click="startLoginWizard"
-              :IsEnabled="!busy && !logoutBusy"
-            />
-            <WinButton
-              v-if="authState?.logged_in"
-              :Content="logoutBusy ? i18n.t('git.loggingOut') : i18n.t('git.logout')"
-              @click="logoutGithub"
-              :IsEnabled="!busy && !logoutBusy"
-            />
-            <WinButton
-              v-else
-              :Content="i18n.t('git.relogin')"
-              @click="startLoginWizard"
               :IsEnabled="!busy"
             />
           </div>
@@ -899,6 +849,49 @@ onBeforeUnmount(() => {
     />
 
     <WinContentDialog
+      v-model:IsOpen="logoutConfirmDialog"
+      :Title="i18n.t('git.logoutConfirmTitle')"
+      :Content="i18n.t('git.logoutConfirmContent')"
+      :PrimaryButtonText="i18n.t('git.logoutConfirmOk')"
+      :CloseButtonText="i18n.t('git.logoutConfirmCancel')"
+      DefaultButton="Close"
+      @PrimaryButtonClick="confirmLogout"
+    />
+
+    <WinContentDialog
+      v-model:IsOpen="commitPushDialog"
+      :Title="i18n.t('git.commitPushTitle')"
+      :PrimaryButtonText="commitPushOnly ? i18n.t('git.commitPushConfirmOnly') : i18n.t('git.commitPushConfirm')"
+      :CloseButtonText="i18n.t('git.commitPushCancel')"
+      :IsPrimaryButtonEnabled="canCommitPush"
+      DefaultButton="Primary"
+      @PrimaryButtonClick="confirmCommitPush"
+    >
+      <div class="git-commit-push-body">
+        <div class="git-commit-push-row">
+          <label>{{ i18n.t('git.commitMessage') }}</label>
+          <WinTextBox
+            :Text="commitPushMsg"
+            :PlaceholderText="i18n.t('git.commitPlaceholder')"
+            @update:Text="(v: string) => (commitPushMsg = v)"
+            Style="width:100%"
+          />
+        </div>
+        <WinCheckBox
+          v-model="commitPushOnly"
+          :Content="i18n.t('git.commitPushOnly')"
+        />
+        <div v-if="commitPushError" class="git-commit-push-error">
+          {{ commitPushError }}
+        </div>
+        <div v-if="commitPushBusy" class="git-commit-push-busy">
+          <WinProgressRing :IsActive="true" :IsIndeterminate="true" :Width="20" :Height="20" />
+          <WinTextBlock :Text="i18n.t('git.commitPushBusy')" Style="font-size:12px;opacity:.7" />
+        </div>
+      </div>
+    </WinContentDialog>
+
+    <WinContentDialog
       v-model:IsOpen="loginWizardOpen"
       :Title="i18n.t('git.wizardTitle')"
       :PrimaryButtonText="loginStep >= 4 ? i18n.t('git.wizSave') : ''"
@@ -915,46 +908,12 @@ onBeforeUnmount(() => {
           <div class="wiz-step" :class="{ active: loginStep === 4, done: loginStep > 4 }">4. {{ i18n.t('git.wizStep4Short') }}</div>
         </div>
 
-        <div class="wiz-terminal-panel">
-          <div class="wiz-terminal-header">
-            <span class="wiz-terminal-title">{{ i18n.t('git.wizTerminal') }}</span>
-            <div class="wiz-terminal-actions">
-              <WinButton
-                :Content="i18n.t('git.wizEnter')"
-                @click="sendEnter"
-                :IsEnabled="!terminalExited"
-                Style="font-size:12px"
-              />
-              <WinButton
-                :Content="i18n.t('git.wizAbort')"
-                @click="terminatePty"
-                :IsEnabled="!terminalExited"
-                Style="font-size:12px"
-              />
-            </div>
+        <div class="wiz-logs">
+          <div v-if="!loginLogs.length && !loginError" class="wiz-log-empty">
+            {{ i18n.t('git.wizLogsEmpty') }}
           </div>
-          <div ref="terminalRef" class="wiz-terminal-output">
-            <pre>{{ terminalOutput || i18n.t('git.wizTerminalEmpty') }}</pre>
-          </div>
-          <div class="wiz-terminal-input-row">
-            <input
-              v-model="terminalInput"
-              class="wiz-terminal-input"
-              :placeholder="i18n.t('git.wizTerminalInputHint')"
-              :disabled="terminalExited"
-              @keydown.enter.prevent="sendTerminalInput"
-            />
-            <WinButton
-              :Content="i18n.t('git.wizSend')"
-              @click="sendTerminalInput"
-              :IsEnabled="!terminalExited"
-              Style="font-size:12px"
-            />
-          </div>
-          <div v-if="loginLogs.length" class="wiz-logs">
-            <div v-for="(line, i) in loginLogs" :key="i" class="wiz-log-line">{{ line }}</div>
-            <div v-if="loginError" class="wiz-log-line wiz-log-error">{{ loginError }}</div>
-          </div>
+          <div v-for="(line, i) in loginLogs" :key="i" class="wiz-log-line">{{ line }}</div>
+          <div v-if="loginError" class="wiz-log-line wiz-log-error">{{ loginError }}</div>
         </div>
 
         <div v-if="loginStep === 4" class="wiz-config-form">
@@ -1013,6 +972,25 @@ onBeforeUnmount(() => {
 
 html.theme-dark .git-toolbar {
   background: var(--SolidBackgroundFillColorBaseBrush, rgba(32, 32, 32, 0.85));
+}
+
+.git-account-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  padding-left: 12px;
+  border-left: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.08));
+}
+
+html.theme-dark .git-account-area {
+  border-left-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.08));
+}
+
+.git-account-area .win-btn {
+  padding: 4px 8px;
+  min-height: 28px;
+  line-height: 1;
 }
 
 .git-selector {
@@ -1163,14 +1141,6 @@ html.theme-dark .git-file-badge {
   flex-shrink: 0;
 }
 
-.git-commit-box {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-top: 8px;
-}
-
 .git-clone-box {
   display: flex;
   align-items: center;
@@ -1226,6 +1196,41 @@ html.theme-dark .git-branch-select {
 
 html.theme-dark .git-remote-actions {
   border-top-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.07));
+}
+
+.git-commit-push-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.git-commit-push-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.git-commit-push-row label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--TextFillColorPrimaryBrush, rgba(0, 0, 0, 0.9));
+}
+
+html.theme-dark .git-commit-push-row label {
+  color: var(--TextFillColorPrimaryBrush, rgba(255, 255, 255, 0.9));
+}
+
+.git-commit-push-error {
+  font-size: 12px;
+  color: var(--system-error, #c42b1c);
+  word-break: break-word;
+}
+
+.git-commit-push-busy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .git-commit-row {
@@ -1332,96 +1337,25 @@ html.theme-dark .wiz-log-panel {
   color: var(--system-error, #c42b1c);
 }
 
-.wiz-terminal-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.wiz-terminal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.wiz-terminal-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--TextFillColorSecondaryBrush, rgba(0, 0, 0, 0.7));
-}
-
-html.theme-dark .wiz-terminal-title {
-  color: var(--TextFillColorSecondaryBrush, rgba(255, 255, 255, 0.7));
-}
-
-.wiz-terminal-actions {
-  display: flex;
-  gap: 6px;
-}
-
-.wiz-terminal-output {
-  background: #0c0c0c;
-  color: #e6e6e6;
-  border-radius: 6px;
-  padding: 10px 12px;
-  height: 220px;
-  max-height: 220px;
-  overflow-y: auto;
-  font-family: "Cascadia Code", "Consolas", monospace;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.wiz-terminal-output pre {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: inherit;
-  font-size: inherit;
-}
-
-.wiz-terminal-input-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.wiz-terminal-input {
-  flex: 1;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.12));
-  background: var(--SolidBackgroundFillColorBaseBrush, rgba(255, 255, 255, 0.6));
-  color: inherit;
-  font-size: 13px;
-  font-family: "Cascadia Code", "Consolas", monospace;
-}
-
-html.theme-dark .wiz-terminal-input {
-  background: var(--SolidBackgroundFillColorBaseBrush, rgba(32, 32, 32, 0.6));
-  border-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.1));
-}
-
-.wiz-terminal-input:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 .wiz-logs {
-  max-height: 120px;
+  max-height: 240px;
   overflow-y: auto;
-  padding: 8px 10px;
+  padding: 10px 12px;
   border-radius: 6px;
   background: rgba(0, 0, 0, 0.04);
   font-family: "Cascadia Code", "Consolas", monospace;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
 }
 
 html.theme-dark .wiz-logs {
   background: rgba(0, 0, 0, 0.3);
   color: rgba(255, 255, 255, 0.85);
+}
+
+.wiz-log-empty {
+  opacity: 0.55;
+  font-style: italic;
 }
 
 .wiz-config-form {
