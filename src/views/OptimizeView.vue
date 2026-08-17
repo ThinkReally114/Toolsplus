@@ -83,7 +83,7 @@ onMounted(refresh);
           <WinToggleSwitch
             :IsOn="states[item.key] ?? false"
             :IsEnabled="!busy[item.key]"
-            @Toggled="(e: { IsOn: boolean }) => onToggle(item.key, e.IsOn)"
+            @Toggled="(e) => onToggle(item.key, e.IsOn)"
           />
         </div>
       </div>
