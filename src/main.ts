@@ -1,8 +1,12 @@
 import { createApp } from "vue";
 import App from "./App.vue";
+import { router } from "./router";
+import { useTheme } from "./composables/useTheme";
+
+import "@winui/styles/theme.css";
+import "@winui/styles/animations.css";
 
 window.addEventListener("error", (e) => {
-  console.error("Window error:", e.message);
   const err = document.getElementById("app-error");
   if (err) {
     err.textContent = "Error: " + e.message + "\n\n" + (e.error?.stack || "");
@@ -11,7 +15,6 @@ window.addEventListener("error", (e) => {
 });
 
 window.addEventListener("unhandledrejection", (e) => {
-  console.error("Unhandled rejection:", e.reason);
   const err = document.getElementById("app-error");
   if (err) {
     err.textContent = "Unhandled: " + String(e.reason);
@@ -20,7 +23,10 @@ window.addEventListener("unhandledrejection", (e) => {
 });
 
 try {
+  useTheme();
+
   const app = createApp(App);
+  app.use(router);
   app.config.errorHandler = (err, _vm, info) => {
     console.error("Vue error:", err, info);
     const el = document.getElementById("app-error");
@@ -30,9 +36,7 @@ try {
     }
   };
   app.mount("#app");
-  console.log("Vue app mounted!");
 } catch (e) {
-  console.error("Fatal error:", e);
   const err = document.getElementById("app-error");
   if (err) {
     err.textContent = "Fatal: " + (e as Error).message + "\n\n" + (e as Error).stack;

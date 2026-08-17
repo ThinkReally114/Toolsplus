@@ -974,6 +974,19 @@ const MenuItemFromContainer = container => {
 
 const ContainerFromMenuItem = item => itemRefs[resolveSelectedValue(item)] ?? null;
 
+const toggleCompact = () => {
+  if (isCompact.value) {
+    wasForceClosed = false;
+    OpenPane();
+  } else {
+    wasForceClosed = true;
+    ClosePane();
+  }
+};
+
+const OpenPane = (emitUpdate = true) => setCompact(false, emitUpdate);
+const ClosePane = (emitUpdate = true) => setCompact(true, emitUpdate);
+
 defineExpose({
   DisplayMode: displayMode,
   SettingsItem: computed(createSettingsItem),
@@ -1501,16 +1514,6 @@ const selectSettings = () => {
   });
 };
 
-const toggleCompact = () => {
-  if (isCompact.value) {
-    wasForceClosed = false;
-    OpenPane();
-  } else {
-    wasForceClosed = true;
-    ClosePane();
-  }
-};
-
 const setCompact = (compact, emitUpdate = true) => {
   if (compact === isCompact.value) return;
   if (compact) {
@@ -1532,9 +1535,6 @@ const setCompact = (compact, emitUpdate = true) => {
   isCompact.value = compact;
   if (emitUpdate) emit('update:IsPaneOpen', !compact);
 };
-
-const OpenPane = (emitUpdate = true) => setCompact(false, emitUpdate);
-const ClosePane = (emitUpdate = true) => setCompact(true, emitUpdate);
 
 const onPaneSearchButtonClick = () => {
   if (!isClosedCompact.value) return;
