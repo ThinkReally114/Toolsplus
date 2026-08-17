@@ -314,7 +314,7 @@ checkAdminOnStartup();
 <style>
 @font-face {
   font-family: "WinUIOnWebIcons";
-  src: url("../external/WinUIonWeb/WinUIonWeb/src/assets/Fonts/SEGOEICONS.TTF")
+  src: url("/SEGOEICONS.TTF")
     format("truetype");
   font-display: block;
 }

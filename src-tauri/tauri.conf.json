@@ -12,7 +12,9 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "ToolsPlus",
+        "url": "index.html",
         "width": 1000,
         "height": 680,
         "minWidth": 720,
