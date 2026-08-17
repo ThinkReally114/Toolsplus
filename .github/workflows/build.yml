@@ -2,6 +2,8 @@ name: Build Single EXE
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -45,21 +47,25 @@ jobs:
           if ($msi) { Write-Output "msi=$msi" }
 
       - name: Upload EXE artifact
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: toolsplus-exe
           path: ${{ steps.find.outputs.exe }}
+          retention-days: 7
 
       - name: Upload NSIS installer
-        if: steps.find.outputs.nsis
+        if: steps.find.outputs.nsis && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@v4
         with:
           name: toolsplus-installer
           path: ${{ steps.find.outputs.nsis }}
+          retention-days: 7
 
       - name: Upload MSI installer
-        if: steps.find.outputs.msi
+        if: steps.find.outputs.msi && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@v4
         with:
           name: toolsplus-msi
           path: ${{ steps.find.outputs.msi }}
+          retention-days: 7
