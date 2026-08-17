@@ -3,11 +3,43 @@ import App from "./App.vue";
 import { router } from "./router";
 import { useTheme } from "./composables/useTheme";
 
-// 引入 WinUIonWeb 的主题样式（含亮/暗主题变量、动画）
 import "@winui/styles/theme.css";
 import "@winui/styles/animations.css";
 
-// 初始化主题（必须在 App 挂载前应用 html 主题类）
-useTheme();
+window.addEventListener("error", (e) => {
+  const err = document.getElementById("app-error");
+  if (err) {
+    err.textContent = "Error: " + e.message + "\n\n" + (e.error?.stack || "");
+    err.style.display = "block";
+  }
+});
 
-createApp(App).use(router).mount("#app");
+window.addEventListener("unhandledrejection", (e) => {
+  const err = document.getElementById("app-error");
+  if (err) {
+    err.textContent = "Unhandled: " + String(e.reason);
+    err.style.display = "block";
+  }
+});
+
+try {
+  useTheme();
+
+  const app = createApp(App);
+  app.use(router);
+  app.config.errorHandler = (err, _vm, info) => {
+    console.error("Vue error:", err, info);
+    const el = document.getElementById("app-error");
+    if (el) {
+      el.textContent = "Vue Error: " + (err as Error).message + "\n\n" + info;
+      el.style.display = "block";
+    }
+  };
+  app.mount("#app");
+} catch (e) {
+  const err = document.getElementById("app-error");
+  if (err) {
+    err.textContent = "Fatal: " + (e as Error).message + "\n\n" + (e as Error).stack;
+    err.style.display = "block";
+  }
+}

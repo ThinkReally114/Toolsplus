@@ -5,10 +5,32 @@
     <link rel="icon" type="image/svg+xml" href="./vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ToolsPlus</title>
+    <style>
+      #app-loading {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        color: #666;
+        font-size: 14px;
+      }
+      #app-error {
+        display: none;
+        padding: 20px;
+        color: #c00;
+        font-family: "Segoe UI", monospace;
+        font-size: 13px;
+        white-space: pre-wrap;
+      }
+    </style>
   </head>
 
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <div id="app-loading">Loading ToolsPlus...</div>
+      <div id="app-error"></div>
+    </div>
     <script type="module" src="./src/main.ts"></script>
   </body>
 </html>

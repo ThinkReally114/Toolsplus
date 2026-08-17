@@ -22,12 +22,10 @@
         "decorations": false,
         "transparent": false,
         "resizable": true,
-        "center": true
+        "center": true,
+        "backgroundColor": "#F3F3F3"
       }
-    ],
-    "security": {
-      "csp": null
-    }
+    ]
   },
   "bundle": {
     "active": true,

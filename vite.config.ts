@@ -14,8 +14,6 @@ const winuiSrc = fileURLToPath(
 export default defineConfig(async () => ({
   plugins: [vue()],
 
-  base: './',
-
   resolve: {
     alias: {
       // 让应用代码可以用 @winui 直接引用 WinUIonWeb 的组件源码
