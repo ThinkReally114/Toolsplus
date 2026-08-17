@@ -1,0 +1,67 @@
+name: Build Single EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Tauri EXE
+        run: npm run tauri build
+
+      - name: Find built artifacts
+        id: find
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "src-tauri/target/release" -Filter "*.exe" -File | Select-Object -ExpandProperty FullName
+          $nsis = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          $msi = Get-ChildItem -Path "src-tauri/target/release/bundle/msi" -Filter "*.msi" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Write-Output "exe=$exe"
+          if ($nsis) { Write-Output "nsis=$nsis" }
+          if ($msi) { Write-Output "msi=$msi" }
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolsplus-exe
+          path: ${{ steps.find.outputs.exe }}
+
+      - name: Upload NSIS installer
+        if: steps.find.outputs.nsis
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolsplus-installer
+          path: ${{ steps.find.outputs.nsis }}
+
+      - name: Upload MSI installer
+        if: steps.find.outputs.msi
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolsplus-msi
+          path: ${{ steps.find.outputs.msi }}
