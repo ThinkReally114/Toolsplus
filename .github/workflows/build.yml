@@ -33,7 +33,7 @@ jobs:
         run: npm run build
 
       - name: Build Tauri (raw EXE)
-        run: npm run tauri build -- --bundles none
+        run: npm run tauri build -- --no-bundle
 
       - name: Build Tauri installers (NSIS/MSI)
         if: startsWith(github.ref, 'refs/tags/v')
