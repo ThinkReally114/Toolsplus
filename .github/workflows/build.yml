@@ -50,9 +50,12 @@ jobs:
           $msiPath = Join-Path $env:GITHUB_WORKSPACE "src-tauri/target/release/bundle/msi"
           $msi = Get-ChildItem -Path $msiPath -Filter "*.msi" -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 
-          if ($exe) { Write-Output "exe=$exe" }
-          if ($nsis) { Write-Output "nsis=$nsis" }
-          if ($msi) { Write-Output "msi=$msi" }
+          if ($exe) { "exe=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8 }
+          if ($nsis) { "nsis=$nsis" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8 }
+          if ($msi) { "msi=$msi" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8 }
+          Write-Host "exe=$exe"
+          Write-Host "nsis=$nsis"
+          Write-Host "msi=$msi"
 
       - name: Upload EXE artifact
         if: steps.find.outputs.exe
