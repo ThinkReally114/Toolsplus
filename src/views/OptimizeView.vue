@@ -61,7 +61,7 @@ onMounted(refresh);
 
 <template>
   <WinScrollViewer class="optimize-scroll" VerticalScrollBarVisibility="Auto" VerticalScrollMode="Auto">
-    <PageShell :title="i18n.t('nav.optimize')" :subtitle="i18n.t('optimize.subtitle')">
+    <PageShell :titleKey="'nav.optimize'" :subtitleKey="'optimize.subtitle'">
       <WinInfoBar
         v-if="error"
         :Message="error"
@@ -83,7 +83,7 @@ onMounted(refresh);
           <WinToggleSwitch
             :IsOn="states[item.key] ?? false"
             :IsEnabled="!busy[item.key]"
-            @Toggled="(e) => onToggle(item.key, e.IsOn)"
+            @Toggled="onToggle(item.key, $event?.IsOn ?? false)"
           />
         </div>
       </div>
