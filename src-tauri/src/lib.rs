@@ -1,4 +1,4 @@
-﻿// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -325,11 +325,41 @@ fn query_gpu_detail() -> (String, String) {
     let mut parts = line.split('|');
     let vram_raw = parts.next().unwrap_or("").trim().to_string();
     let driver = parts.next().unwrap_or("").trim().to_string();
-    let vram = vram_raw
-        .parse::<u64>()
-        .map(fmt_bytes)
-        .unwrap_or_else(|_| "未知".to_string());
+    let vram = if let Some(bytes) = query_gpu_vram_dxgi() {
+        fmt_bytes(bytes)
+    } else {
+        vram_raw
+            .parse::<u64>()
+            .map(fmt_bytes)
+            .unwrap_or_else(|_| "未知".to_string())
+    };
     (vram, if driver.is_empty() { "未知".to_string() } else { driver })
+}
+
+/// 通过 DXGI 枚举显卡获取真实显存（WMI AdapterRAM 为 32 位字段，4GB 以上会溢出）
+fn query_gpu_vram_dxgi() -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+    };
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    for i in 0..8 {
+        let adapter = match unsafe { factory.EnumAdapters1(i) } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        let desc = unsafe { adapter.GetDesc1() }.ok()?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            continue;
+        }
+        let name = String::from_utf16_lossy(&desc.Description);
+        if name.trim_end_matches('\0').trim().is_empty() {
+            continue;
+        }
+        if desc.DedicatedVideoMemory > 0 {
+            return Some(desc.DedicatedVideoMemory as u64);
+        }
+    }
+    None
 }
 
 /// 查询内存条信息：速率、品牌
@@ -401,10 +431,14 @@ fn run_powershell(
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let mut child = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
 
     let start = Instant::now();
@@ -542,6 +576,7 @@ struct ProcessInfo {
     memory_percent: f32,
     status: String,
     icon: Option<String>,
+    is_self: bool,
 }
 
 /// exe 图标缓存：相同路径只提取一次
@@ -764,6 +799,7 @@ fn list_processes() -> Vec<ProcessInfo> {
     sys.refresh_processes(ProcessesToUpdate::All, true);
 
     let total_mem = sys.total_memory();
+    let self_pid = std::process::id();
     let mut entries: Vec<ProcessInfo> = sys
         .processes()
         .iter()
@@ -789,6 +825,7 @@ fn list_processes() -> Vec<ProcessInfo> {
                 memory_percent: mem_percent,
                 status,
                 icon: None,
+                is_self: pid.as_u32() == self_pid,
             }
         })
         .collect();
@@ -881,6 +918,8 @@ fn kill_process(pid: u32) -> Result<String, String> {
 /// 在指定目录执行 git 命令，返回 (成功与否, stdout, stderr)
 fn run_git(repo: &str, args: &[&str]) -> (bool, String, String) {
     use std::process::{Command, Stdio};
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let candidates: Vec<std::ffi::OsString> = vec![
         "git".into(),
         r"C:\Program Files\Git\cmd\git.exe".into(),
@@ -895,6 +934,7 @@ fn run_git(repo: &str, args: &[&str]) -> (bool, String, String) {
             .current_dir(repo)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(out) => {
@@ -912,10 +952,13 @@ fn run_git(repo: &str, args: &[&str]) -> (bool, String, String) {
 #[command]
 fn check_git() -> bool {
     use std::process::{Command, Stdio};
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     if Command::new("git")
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -1262,6 +1305,7 @@ fn git_pull(repo: String) -> Result<String, String> {
 #[command]
 async fn git_clone(url: String, target_dir: String) -> Result<String, String> {
     use std::process::Command;
+    use std::os::windows::process::CommandExt;
     let task = tauri::async_runtime::spawn_blocking(move || {
         let repo_name = url
             .trim_end_matches('/')
@@ -1272,6 +1316,7 @@ async fn git_clone(url: String, target_dir: String) -> Result<String, String> {
         let dest_str = dest.to_string_lossy().to_string();
         let out = Command::new("git")
             .args(["clone", &url, &dest_str])
+            .creation_flags(0x0800_0000)
             .output()
             .map_err(|e| e.to_string())?;
         if out.status.success() {
@@ -1310,10 +1355,12 @@ struct GhAuthState {
 
 fn gh_available() -> bool {
     use std::process::{Command, Stdio};
+    use std::os::windows::process::CommandExt;
     Command::new("gh")
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .creation_flags(0x0800_0000)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -1335,10 +1382,13 @@ async fn gh_auth_state() -> GhAuthState {
     }
     let combined = tauri::async_runtime::spawn_blocking(|| {
         use std::process::{Command, Stdio};
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         match Command::new("gh")
             .args(["auth", "status"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             Ok(o) => format!(
@@ -1542,7 +1592,9 @@ fn is_admin() -> bool {
 /// 以管理员权限重新启动当前应用（通过 ShellExecute runas）
 #[command]
 fn relaunch_as_admin() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe_str = exe.to_string_lossy().to_string();
     Command::new("powershell")
@@ -1554,6 +1606,7 @@ fn relaunch_as_admin() -> Result<(), String> {
                 exe_str.replace('\'', "''")
             ),
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1629,22 +1682,54 @@ fn write_reg_string(hive: &str, path: &str, name: &str, value: &str) -> Result<(
 }
 
 fn control_service(name: &str, stop: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let action = if stop { "stop" } else { "start" };
     let out = Command::new("sc")
         .args([action, name])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !out.status.success() || stdout.contains("FAILED") || stdout.contains("拒绝") {
+        let detail = if !stdout.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+        let hint = if stdout.contains("access") || stdout.contains("5") || stdout.contains("拒绝") {
+            "（需要管理员权限，且部分受保护服务需先禁用其启动类型）"
+        } else {
+            ""
+        };
+        return Err(format!("{}{}", detail, if hint.is_empty() { "" } else { hint }));
+    }
+    Ok(())
+}
+
+/// 设置服务启动类型（disabled=禁用 / auto=自动 / demand=手动）
+fn config_service_start(name: &str, mode: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = Command::new("sc")
+        .args(["config", name, "start=", mode])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !out.status.success() || stdout.contains("FAILED") || stdout.contains("拒绝") {
+        let detail = if !stdout.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+        return Err(detail.to_string());
     }
     Ok(())
 }
 
 fn is_service_running(name: &str) -> bool {
     use std::process::Command;
+    use std::os::windows::process::CommandExt;
     Command::new("sc")
         .args(["query", name])
+        .creation_flags(0x0800_0000)
         .output()
         .map(|o| {
             let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
@@ -1656,25 +1741,6 @@ fn is_service_running(name: &str) -> bool {
 /// 优化项配置：每一项定义注册表/服务，前端按 key 查询状态
 fn optimize_items() -> Vec<OptimizeItem> {
     vec![
-        OptimizeItem {
-            key: "defender".into(),
-            title: "Windows Defender".into(),
-            desc: "实时保护防病毒".into(),
-            reg: vec![RegOp {
-                hive: "HKLM".into(),
-                path: r"SOFTWARE\Microsoft\Windows Defender\Real-Time Protection".into(),
-                name: "DisableRealtimeMonitoring".into(),
-                kind: RegKind::Dword,
-            }],
-            service: Some("WinDefend".into()),
-        },
-        OptimizeItem {
-            key: "firewall".into(),
-            title: "Windows 防火墙".into(),
-            desc: "网络防火墙防护".into(),
-            reg: vec![],
-            service: Some("MpsSvc".into()),
-        },
         OptimizeItem {
             key: "smartscreen".into(),
             title: "SmartScreen".into(),
@@ -1694,13 +1760,6 @@ fn optimize_items() -> Vec<OptimizeItem> {
                 },
             ],
             service: None,
-        },
-        OptimizeItem {
-            key: "securityhealth".into(),
-            title: "SecurityHealth 服务".into(),
-            desc: "Windows 安全中心服务".into(),
-            reg: vec![],
-            service: Some("SecurityHealthService".into()),
         },
         OptimizeItem {
             key: "uac".into(),
@@ -1779,7 +1838,8 @@ async fn optimize_set(key: String, enable: bool) -> Result<(), String> {
     let task = tauri::async_runtime::spawn_blocking(move || {
         if enable {
             if let Some(svc) = &item.service {
-                control_service(svc, false)?;
+                let _ = config_service_start(svc, "auto");
+                let _ = control_service(svc, false);
             }
             for r in &item.reg {
                 match r.kind {
@@ -1795,7 +1855,8 @@ async fn optimize_set(key: String, enable: bool) -> Result<(), String> {
                 }
             }
             if let Some(svc) = &item.service {
-                control_service(svc, true)?;
+                let _ = config_service_start(svc, "disabled");
+                let _ = control_service(svc, true);
             }
         }
         Ok::<(), String>(())

@@ -19,6 +19,7 @@ interface ProcessInfo {
   memory_percent: number;
   status: string;
   icon: string | null;
+  is_self: boolean;
 }
 
 interface ProcessIconEntry {
@@ -35,6 +36,7 @@ const killMessage = ref("");
 const killDialogOpen = ref(false);
 const killTargetName = ref("");
 const killTargetPid = ref<number | null>(null);
+const killTargetIcon = ref<string | null>(null);
 let iconToken = 0;
 
 const hasTauri =
@@ -114,6 +116,7 @@ async function killSelected() {
   killTargetPid.value = selectedPid.value;
   const proc = processes.value.find((p) => p.pid === killTargetPid.value);
   killTargetName.value = proc?.name || String(killTargetPid.value);
+  killTargetIcon.value = proc?.icon ?? null;
   killDialogOpen.value = true;
 }
 
@@ -190,7 +193,7 @@ onMounted(refresh);
         v-for="p in filteredProcesses"
         :key="p.pid"
         class="proc-row"
-        :class="{ selected: selectedPid === p.pid }"
+        :class="{ selected: selectedPid === p.pid, 'is-self': p.is_self }"
         @click="selectRow(p.pid)"
       >
         <img
@@ -200,7 +203,10 @@ onMounted(refresh);
           alt=""
         />
         <span v-else class="proc-icon-placeholder" />
-        <WinTextBlock :Text="p.name" Style="font-size:13px" />
+        <span class="proc-name-cell">
+          <WinTextBlock :Text="p.name" Style="font-size:13px" />
+          <span v-if="p.is_self" class="proc-self-badge">{{ i18n.t("process.selfBadge") }}</span>
+        </span>
         <WinTextBlock :Text="String(p.pid)" Style="font-size:13px;opacity:.8" Foreground="secondary" />
         <WinTextBlock :Text="`${p.cpu_usage.toFixed(1)}%`" Style="font-size:13px;text-align:right" />
         <WinTextBlock :Text="formatBytes(p.memory)" Style="font-size:13px;text-align:right" />
@@ -225,12 +231,28 @@ onMounted(refresh);
     <WinContentDialog
       v-model:IsOpen="killDialogOpen"
       :Title="i18n.t('process.killConfirmTitle')"
-      :Content="i18n.t('process.killConfirm', { name: killTargetName, pid: killTargetPid || 0 })"
       :PrimaryButtonText="i18n.t('process.killBtn')"
       :CloseButtonText="i18n.t('process.cancelBtn')"
       DefaultButton="Primary"
       @PrimaryButtonClick="confirmKill"
-    />
+    >
+      <div class="kill-dialog-body">
+        <img
+          v-if="killTargetIcon"
+          :src="killTargetIcon"
+          class="kill-dialog-icon"
+          alt=""
+        />
+        <span v-else class="proc-icon-placeholder kill-dialog-icon" />
+        <div class="kill-dialog-text">
+          <div class="kill-dialog-name-row">
+            <span class="kill-dialog-name">{{ killTargetName }}</span>
+            <span class="kill-dialog-pid">PID: {{ killTargetPid }}</span>
+          </div>
+          <div class="kill-dialog-hint">{{ i18n.t("process.killConfirmHint") }}</div>
+        </div>
+      </div>
+    </WinContentDialog>
   </PageShell>
 </template>
 
@@ -319,5 +341,84 @@ html.theme-dark .proc-row:hover {
 
 html.theme-dark .proc-row.selected {
   background: var(--SubtleFillColorSecondary, rgba(255, 255, 255, 0.1));
+}
+
+.proc-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.proc-row.is-self {
+  background: color-mix(in srgb, var(--AccentButtonBackground, #005fb8) 7%, transparent);
+  box-shadow: inset 3px 0 0 var(--AccentButtonBackground, #005fb8);
+}
+
+html.theme-dark .proc-row.is-self {
+  background: color-mix(in srgb, #4cc2ff 9%, transparent);
+  box-shadow: inset 3px 0 0 #4cc2ff;
+}
+
+.proc-self-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 16px;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: #fff;
+  background: var(--AccentButtonBackground, #005fb8);
+}
+
+html.theme-dark .proc-self-badge {
+  color: #003a6b;
+  background: #4cc2ff;
+}
+
+.kill-dialog-body {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 0 8px;
+}
+
+.kill-dialog-icon {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.kill-dialog-text {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.kill-dialog-name-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.kill-dialog-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary, inherit);
+  word-break: break-all;
+}
+
+.kill-dialog-pid {
+  font-size: 13px;
+  color: var(--text-secondary, inherit);
+  opacity: 0.85;
+}
+
+.kill-dialog-hint {
+  font-size: 13px;
+  color: var(--text-secondary, inherit);
+  opacity: 0.9;
 }
 </style>

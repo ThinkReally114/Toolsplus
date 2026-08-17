@@ -17,10 +17,7 @@ interface OptItem {
   descKey: string;
 }
 const items: OptItem[] = [
-  { key: "defender", titleKey: "opt.defender.title", descKey: "opt.defender.desc" },
-  { key: "firewall", titleKey: "opt.firewall.title", descKey: "opt.firewall.desc" },
   { key: "smartscreen", titleKey: "opt.smartscreen.title", descKey: "opt.smartscreen.desc" },
-  { key: "securityhealth", titleKey: "opt.securityhealth.title", descKey: "opt.securityhealth.desc" },
   { key: "uac", titleKey: "opt.uac.title", descKey: "opt.uac.desc" },
   { key: "amsi", titleKey: "opt.amsi.title", descKey: "opt.amsi.desc" },
   { key: "stickykeys", titleKey: "opt.stickykeys.title", descKey: "opt.stickykeys.desc" },
@@ -49,7 +46,7 @@ async function onToggle(key: string, enable: boolean) {
     await invoke("optimize_set", { key, enable });
     await refresh();
   } catch (e) {
-    error.value = String(e);
+    error.value = i18n.t("optimize.denied", { detail: String(e) });
     await refresh();
   } finally {
     busy.value[key] = false;

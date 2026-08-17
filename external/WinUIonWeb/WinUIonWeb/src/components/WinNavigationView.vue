@@ -130,7 +130,7 @@
                   :inert="isPaneGroupChildrenVisible ? undefined : ''">
                   <div class="win-nav-group-children-inner" :ref="el => setChildrenRef(item.value, el)">
                     <div v-for="child in item.children" :key="child.value" class="win-nav-item win-nav-group-child" role="button" :class="{ 'is-selected': selectedValue === child.value, 'is-disabled': !child.isEnabled }" :aria-disabled="!child.isEnabled || undefined" v-bind="itemToolTipAttrs(child)" @click="onChildClick(item, child)" :ref="el => setItemRef(child.value, el)">
-                      <span v-if="child.icon" class="icon">{{ child.icon }}</span>
+                      <span v-if="child.icon" class="icon"><component v-if="typeof child.icon === 'object'" :is="child.icon" /><template v-else>{{ child.icon }}</template></span>
                       <WinTextBlock class="label" :Text="child.label" />
                       <WinInfoBadge v-if="child.infoBadge" class="win-nav-infobadge" v-bind="child.infoBadge" />
                     </div>
@@ -186,7 +186,7 @@
             <div class="win-nav-group-children" :style="{ height: groupExpanded[item.value] ? ((item.children?.length || 0) * 36) + 'px' : '0px' }">
               <div class="win-nav-group-children-inner">
                 <div v-for="child in item.children" :key="child.value" class="win-nav-item win-nav-group-child" role="button" :class="{ 'is-selected': selectedValue === child.value, 'is-disabled': !child.isEnabled }" :aria-disabled="!child.isEnabled || undefined" v-bind="itemToolTipAttrs(child)" @click="onMoreChildClick(item, child)">
-                  <span v-if="child.icon" class="icon">{{ child.icon }}</span>
+                  <span v-if="child.icon" class="icon"><component v-if="typeof child.icon === 'object'" :is="child.icon" /><template v-else>{{ child.icon }}</template></span>
                   <WinTextBlock class="label" :Text="child.label" />
                   <WinInfoBadge v-if="child.infoBadge" class="win-nav-infobadge" v-bind="child.infoBadge" />
                 </div>
@@ -341,7 +341,7 @@ const internalSelectedItem = ref(officialProps.SelectedItem);
 const flattenedItems = computed(() => [...menuItems.value, ...footerItems.value]
   .flatMap(item => [item, ...(item.children || [])]));
 const resolveSelectedValue = (selectedItem) => {
-  if (selectedItem?.IsSettingsItem || getItemTag(selectedItem) === 'settings') return 'settings';
+  if (selectedItem?.IsSettingsItem || (isSettingsVisible.value && getItemTag(selectedItem) === 'settings')) return 'settings';
   if (selectedItem && typeof selectedItem === 'object') {
     const rawSelectedItem = toRaw(selectedItem);
     const exactItem = flattenedItems.value.find(item => item.source === selectedItem || toRaw(item.source) === rawSelectedItem);
@@ -1335,9 +1335,6 @@ const onGroupHeaderClick = (item, invokeItem = true) => {
       flyoutAnchor.value = rect;
       flyoutGroupValue.value = item.value;
       const items = [];
-      if (item.selectsOnInvoked !== false) {
-        items.push({ Text: item.label, Value: item.value, Icon: item.icon, IsHeader: true, IsEnabled: item.isEnabled });
-      }
       for (const child of (item.children || [])) {
         items.push({ Text: child.label, Value: child.value, Icon: child.icon, IsEnabled: child.isEnabled });
       }
@@ -1377,9 +1374,6 @@ const onGroupHeaderClick = (item, invokeItem = true) => {
       };
       flyoutGroupValue.value = item.value;
       const items = [];
-      if (item.selectsOnInvoked !== false) {
-        items.push({ Text: item.label, Value: item.value, Icon: item.icon, IsHeader: true, IsEnabled: item.isEnabled });
-      }
       for (const child of (item.children || [])) {
         items.push({ Text: child.label, Value: child.value, Icon: child.icon, IsEnabled: child.isEnabled });
       }

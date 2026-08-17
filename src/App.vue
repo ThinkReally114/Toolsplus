@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, provide, h, ref, watch } from "vue";
+import { computed, provide, h, ref, watch, onMounted } from "vue";
 import { useRouter } from "vue-router";
 import WinNavigationView from "@winui/components/WinNavigationView.vue";
 import WinTextBlock from "@winui/components/WinTextBlock.vue";
@@ -236,7 +236,7 @@ async function checkAdminOnStartup() {
   try {
     const admin = await invoke<boolean>("is_admin");
     if (admin) return;
-    if (localStorage.getItem(ADMIN_KEY) === "1") return;
+    if (sessionStorage.getItem(ADMIN_KEY) === "1") return;
     adminDialogOpen.value = true;
   } catch {
     // 命令不可用则跳过
@@ -248,8 +248,9 @@ async function confirmElevate() {
   adminChecking.value = true;
   try {
     await invoke("relaunch_as_admin");
-    // 提权后新实例已启动，提示用户关闭当前窗口
-    setTimeout(() => window.close(), 1500);
+    exitConfirmed = true;
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    await getCurrentWindow().destroy();
   } catch (e) {
     console.error("提权失败", e);
     adminChecking.value = false;
@@ -258,10 +259,40 @@ async function confirmElevate() {
 
 function declineElevate() {
   adminDialogOpen.value = false;
-  localStorage.setItem(ADMIN_KEY, "1");
+  sessionStorage.setItem(ADMIN_KEY, "1");
 }
 
 checkAdminOnStartup();
+
+// 退出应用：拦截所有关闭请求（标题栏 X / Alt+F4 / 任务栏关闭），弹模态框二次确认
+const exitDialogOpen = ref(false);
+let exitConfirmed = false;
+
+onMounted(async () => {
+  if (typeof (window as any).__TAURI_INTERNALS__ === "undefined") return;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const appWindow = getCurrentWindow();
+    await appWindow.onCloseRequested((event) => {
+      if (exitConfirmed) return;
+      event.preventDefault();
+      exitDialogOpen.value = true;
+    });
+  } catch (e) {
+    console.error(e);
+  }
+});
+
+async function confirmExit() {
+  exitDialogOpen.value = false;
+  exitConfirmed = true;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    await getCurrentWindow().destroy();
+  } catch (e) {
+    console.error(e);
+  }
+}
 </script>
 
 <template>
@@ -307,6 +338,16 @@ checkAdminOnStartup();
       DefaultButton="Primary"
       @PrimaryButtonClick="confirmElevate"
       @CloseButtonClick="declineElevate"
+    />
+
+    <WinContentDialog
+      v-model:IsOpen="exitDialogOpen"
+      :Title="t('exit.title')"
+      :Content="t('exit.content')"
+      :PrimaryButtonText="t('exit.confirm')"
+      :CloseButtonText="t('exit.cancel')"
+      DefaultButton="Close"
+      @PrimaryButtonClick="confirmExit"
     />
   </div>
 </template>

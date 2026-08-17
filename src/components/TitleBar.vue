@@ -22,7 +22,23 @@ async function checkTauri() {
   }
 }
 
-onMounted(checkTauri);
+onMounted(async () => {
+  await checkTauri();
+  if (!hasTauri.value) return;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const appWindow = getCurrentWindow();
+    await appWindow.onResized(async () => {
+      try {
+        isMaximized.value = await appWindow.isMaximized();
+      } catch {
+        // ignore
+      }
+    });
+  } catch {
+    // ignore
+  }
+});
 
 async function onMinimize() {
   if (!hasTauri.value) return;

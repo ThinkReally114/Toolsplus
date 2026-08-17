@@ -22,6 +22,12 @@
               :FontWeight="600"
               TextWrapping="WrapWholeWords" />
             <div class="win-content-dialog-body">
+              <WinTextBlock
+                v-if="Content"
+                class="win-content-dialog-content-text"
+                :Text="Content"
+                :FontSize="14"
+                TextWrapping="WrapWholeWords" />
               <slot></slot>
             </div>
           </WinScrollViewer>

@@ -53,7 +53,22 @@ async function loadHardware() {
   }
 }
 
-onMounted(loadHardware);
+const isAdmin = ref(false);
+
+async function checkAdmin() {
+  const hasTauri = typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
+  if (!hasTauri) return;
+  try {
+    isAdmin.value = await invoke<boolean>("is_admin");
+  } catch {
+    // ignore
+  }
+}
+
+onMounted(() => {
+  loadHardware();
+  checkAdmin();
+});
 
 const headerTiles = computed(() => [
   {
@@ -214,6 +229,13 @@ function go(tag: string) {
               :FontSize="40"
               FontWeight="600"
               :LineHeight="52"
+            />
+            <WinTextBlock
+              v-if="isAdmin"
+              class="home-header-admin-welcome"
+              :Text="i18n.t('home.adminWelcome')"
+              :FontSize="16"
+              :LineHeight="24"
             />
           </div>
 
@@ -383,6 +405,12 @@ html.theme-dark .home-header-image {
 
 .home-header-title {
   color: var(--text-primary);
+}
+
+.home-header-admin-welcome {
+  color: var(--text-primary);
+  opacity: 0.8;
+  margin-top: 4px;
 }
 
 .home-header-tiles-scroll {
