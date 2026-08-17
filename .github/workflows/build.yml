@@ -32,6 +32,31 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Verify frontend dist
+        shell: pwsh
+        run: |
+          $distPath = Join-Path $env:GITHUB_WORKSPACE "dist"
+          if (Test-Path $distPath) {
+            Write-Host "=== dist/ contents ==="
+            Get-ChildItem $distPath -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize
+            $indexFile = Join-Path $distPath "index.html"
+            if (Test-Path $indexFile) {
+              Write-Host "=== index.html first 500 chars ==="
+              Get-Content $indexFile -TotalCount 30
+            } else {
+              Write-Host "ERROR: index.html not found in dist/"
+            }
+          } else {
+            Write-Host "ERROR: dist/ directory not found"
+          }
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolsplus-dist
+          path: dist/
+          retention-days: 3
+
       - name: Build Tauri (raw EXE)
         run: npm run tauri build -- --no-bundle
 
