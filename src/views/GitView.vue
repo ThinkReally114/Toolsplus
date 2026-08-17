@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { inject, ref, computed, onMounted } from "vue";
+import { inject, ref, computed, onMounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import PageShell from "@/components/PageShell.vue";
 import WinTextBlock from "@winui/components/WinTextBlock.vue";
@@ -36,6 +36,7 @@ interface GitCommit {
   author: string;
   date: string;
   message: string;
+  body: string;
 }
 
 interface GhAuthState {
@@ -67,9 +68,36 @@ const commitMsg = ref("");
 const notice = ref("");
 const commitPushDialog = ref(false);
 const commitPushMsg = ref("");
+const commitPushBody = ref("");
 const commitPushBusy = ref(false);
 const commitPushError = ref("");
 const commitPushOnly = ref(false);
+const resultDialog = ref(false);
+const resultDialogTitle = ref("");
+const resultDialogContent = ref("");
+const repoSettingsDialog = ref(false);
+const repoSettingsPath = ref("");
+const repoSettingsBusy = ref(false);
+const repoSettingsError = ref("");
+const repoSettingsNotGit = ref(false);
+const repoSettingsInitBusy = ref(false);
+const revertDialog = ref(false);
+const revertTarget = ref<GitCommit | null>(null);
+const revertBusy = ref(false);
+const revertError = ref("");
+const revertNoCommit = ref(false);
+const expandedCommit = ref<string | null>(null);
+
+function toggleCommitExpand(c: GitCommit) {
+  if (expandedCommit.value === c.hash) {
+    expandedCommit.value = null;
+  } else {
+    expandedCommit.value = c.hash;
+  }
+}
+const welcomeBusy = ref(false);
+const welcomeInitBusy = ref(false);
+const welcomeError = ref("");
 
 const stagedFiles = computed(
   () => status.value?.files.filter((f) => f.staged) ?? []
@@ -89,6 +117,14 @@ const canCommitPush = computed(
     commitPushMsg.value.trim().length > 0 &&
     !commitPushBusy.value
 );
+
+const repoName = computed(() => {
+  const p = repoPath.value.trim();
+  if (!p) return "";
+  const sep = p.includes("/") ? "/" : "\\";
+  const parts = p.split(sep).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : p;
+});
 
 const cloneUrl = ref("");
 const cloneTarget = ref("");
@@ -133,6 +169,96 @@ async function browseFolder() {
   }
 }
 
+function openRepoSettings() {
+  repoSettingsPath.value = repoPath.value;
+  repoSettingsError.value = "";
+  repoSettingsNotGit.value = false;
+  repoSettingsInitBusy.value = false;
+  repoSettingsDialog.value = true;
+}
+
+async function browseRepoSettings() {
+  try {
+    const p = await invoke<string | null>("pick_folder");
+    if (p) repoSettingsPath.value = p;
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function confirmRepoSettings() {
+  repoError.value = "";
+  if (!repoSettingsPath.value.trim()) {
+    repoSettingsError.value = i18n.t("git.repoSettingsEmpty");
+    // WinContentDialog 在 PrimaryButtonClick 后会自动关闭，这里重新打开以显示错误
+    await nextTick();
+    repoSettingsDialog.value = true;
+    return;
+  }
+  repoSettingsBusy.value = true;
+  repoSettingsError.value = "";
+  try {
+    const root = await invoke<string | null>("git_repo_root", {
+      path: repoSettingsPath.value,
+    });
+    if (!root) {
+      repoSettingsError.value = i18n.t("git.noRepo");
+      repoSettingsNotGit.value = true;
+      repoSettingsBusy.value = false;
+      // WinContentDialog 在 PrimaryButtonClick 后会自动关闭，这里重新打开以显示错误
+      await nextTick();
+      repoSettingsDialog.value = true;
+      return;
+    }
+    repoPath.value = root;
+    localStorage.setItem("git.repoPath", root);
+    await refreshAll();
+    await refreshBranches();
+    await refreshAuth();
+    await checkLoginNeeded();
+    repoSettingsDialog.value = false;
+  } catch (e) {
+    repoSettingsError.value = String(e);
+    await nextTick();
+    repoSettingsDialog.value = true;
+  } finally {
+    repoSettingsBusy.value = false;
+  }
+}
+
+async function initRepoAndEnterWizard() {
+  if (!repoSettingsPath.value.trim()) {
+    repoSettingsError.value = i18n.t("git.repoSettingsEmpty");
+    await nextTick();
+    repoSettingsDialog.value = true;
+    return;
+  }
+  repoSettingsInitBusy.value = true;
+  repoSettingsError.value = "";
+  try {
+    await invoke<string>("git_init", { path: repoSettingsPath.value });
+    repoPath.value = repoSettingsPath.value;
+    localStorage.setItem("git.repoPath", repoPath.value);
+    repoSettingsDialog.value = false;
+    await refreshAll();
+    await refreshBranches();
+    await refreshAuth();
+    showResult(i18n.t("git.initSuccessTitle"), i18n.t("git.initSuccess"));
+    await startLoginWizard();
+  } catch (e) {
+    repoSettingsError.value = String(e);
+    await nextTick();
+    repoSettingsDialog.value = true;
+  } finally {
+    repoSettingsInitBusy.value = false;
+  }
+}
+
+async function resetRepoSettingsSelection() {
+  repoSettingsNotGit.value = false;
+  await confirmRepoSettings();
+}
+
 async function browseCloneTarget() {
   try {
     const p = await invoke<string | null>("pick_folder");
@@ -145,18 +271,21 @@ async function browseCloneTarget() {
 async function cloneRepo() {
   if (!cloneUrl.value || !cloneTarget.value) return;
   cloning.value = true;
-  notice.value = "";
+  repoSettingsError.value = "";
   try {
     const dest = await invoke<string>("git_clone", {
       url: cloneUrl.value,
       targetDir: cloneTarget.value,
     });
     repoPath.value = dest;
-    notice.value = "cloned";
+    repoSettingsPath.value = dest;
+    cloneUrl.value = "";
+    cloneTarget.value = "";
     await detectRepo();
+    repoSettingsDialog.value = false;
+    showResult(i18n.t("git.cloneSuccessTitle"), i18n.t("git.cloneSuccess"));
   } catch (e) {
-    notice.value = "";
-    repoError.value = String(e);
+    repoSettingsError.value = String(e);
   } finally {
     cloning.value = false;
   }
@@ -183,7 +312,7 @@ async function pullRepo() {
   try {
     await invoke("git_pull", { repo: repoPath.value });
     await refreshAll();
-    notice.value = "pulled";
+    showResult(i18n.t("git.pullSuccessTitle"), i18n.t("git.pullSuccess"));
   } catch (e) {
     repoError.value = String(e);
   } finally {
@@ -231,11 +360,17 @@ async function detectRepo() {
   }
 }
 
-async function refreshAuth() {
-  try {
-    authState.value = await invoke<GhAuthState>("gh_auth_state");
-  } catch {
-    authState.value = null;
+async function refreshAuth(retries = 3, delayMs = 800) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const state = await invoke<GhAuthState>("gh_auth_state");
+      authState.value = state;
+      if (state.logged_in && state.user) return;
+      if (!state.logged_in) return;
+    } catch {
+      authState.value = null;
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
   }
 }
 
@@ -324,8 +459,48 @@ async function commit() {
   }
 }
 
+function showResult(title: string, content: string) {
+  resultDialogTitle.value = title;
+  resultDialogContent.value = content;
+  resultDialog.value = true;
+}
+
+function openRevertDialog(c: GitCommit) {
+  revertTarget.value = c;
+  revertError.value = "";
+  revertNoCommit.value = false;
+  revertDialog.value = true;
+}
+
+async function confirmRevert() {
+  if (!revertTarget.value) return;
+  revertBusy.value = true;
+  revertError.value = "";
+  try {
+    await invoke("git_revert", {
+      repo: repoPath.value,
+      hash: revertTarget.value.hash,
+      noCommit: revertNoCommit.value,
+    });
+    await refreshAll();
+    await refreshBranches();
+    revertDialog.value = false;
+    showResult(
+      i18n.t("git.revertSuccessTitle"),
+      i18n.t("git.revertSuccess", { hash: revertTarget.value.short_hash })
+    );
+  } catch (e) {
+    revertError.value = String(e);
+    await nextTick();
+    revertDialog.value = true;
+  } finally {
+    revertBusy.value = false;
+  }
+}
+
 function openCommitPushDialog() {
   commitPushMsg.value = commitMsg.value || "";
+  commitPushBody.value = "";
   commitPushError.value = "";
   commitPushOnly.value = false;
   commitPushDialog.value = true;
@@ -334,6 +509,8 @@ function openCommitPushDialog() {
 async function confirmCommitPush() {
   if (!commitPushMsg.value.trim()) {
     commitPushError.value = i18n.t("git.commitMsgEmpty");
+    await nextTick();
+    commitPushDialog.value = true;
     return;
   }
   commitPushBusy.value = true;
@@ -342,25 +519,28 @@ async function confirmCommitPush() {
     await invoke("git_commit", {
       repo: repoPath.value,
       message: commitPushMsg.value,
+      body: commitPushBody.value.trim() || undefined,
       branch: selectedBranch.value || undefined,
     });
     commitMsg.value = "";
     await refreshAll();
     await refreshBranches();
     if (commitPushOnly.value) {
-      notice.value = "ok";
       commitPushDialog.value = false;
+      showResult(i18n.t("git.commitSuccessTitle"), i18n.t("git.commitSuccess"));
     } else {
       await invoke("git_push", {
         repo: repoPath.value,
         branch: selectedBranch.value || undefined,
       });
-      notice.value = "pushed";
       await refreshAll();
       commitPushDialog.value = false;
+      showResult(i18n.t("git.pushSuccessTitle"), i18n.t("git.pushSuccess"));
     }
   } catch (e) {
     commitPushError.value = String(e);
+    await nextTick();
+    commitPushDialog.value = true;
   } finally {
     commitPushBusy.value = false;
   }
@@ -374,8 +554,8 @@ async function push() {
       repo: repoPath.value,
       branch: selectedBranch.value || undefined,
     });
-    notice.value = "pushed";
     await refreshAll();
+    showResult(i18n.t("git.pushSuccessTitle"), i18n.t("git.pushSuccess"));
   } catch (e) {
     repoError.value = String(e);
   } finally {
@@ -425,7 +605,8 @@ async function confirmLogout() {
   try {
     await invoke<string>("gh_logout");
     await refreshAuth();
-    notice.value = "loggedOut";
+    // 退出后延迟再刷新，确保多账号场景下完全清空
+    setTimeout(() => refreshAuth(), 1000);
     // 退出后弹出引导对话框：登录或跳过
     needLoginDialog.value = true;
   } catch (e) {
@@ -457,6 +638,8 @@ async function startLoginWizard() {
       throw new Error("未检测到登录用户名");
     }
     appendLog(i18n.t("git.wizLoginSuccess", { user }));
+    // 登录成功后立即刷新一次 authState，确保 UI 不显示旧账号
+    await refreshAuth();
     loginStep.value = 3;
     appendLog(i18n.t("git.wizStep3"));
     if (repoPath.value) {
@@ -499,6 +682,7 @@ async function saveGitConfig() {
     loginStep.value = 5;
     appendLog(i18n.t("git.wizDone"));
     await refreshAuth();
+    setTimeout(() => refreshAuth(), 1500);
     setTimeout(() => {
       loginWizardOpen.value = false;
     }, 2000);
@@ -509,8 +693,60 @@ async function saveGitConfig() {
 }
 
 function closeLoginWizard() {
+  // 如果登录未完成（step < 5），先尝试取消 pw 登录窗口
+  // step >= 5 表示已经完成配置，pw 窗口已自动关闭
+  if (loginStep.value < 5) {
+    invoke("gh_cancel_login").catch(() => {
+      // 忽略错误，确保对话框一定能关闭
+    });
+  }
   loginWizardOpen.value = false;
+  // 关闭时多次延迟刷新，确保 gh token 已完全切换
   refreshAuth();
+  setTimeout(() => refreshAuth(), 1500);
+  setTimeout(() => refreshAuth(), 3000);
+}
+
+async function welcomeCreateRepo() {
+  if (welcomeInitBusy.value) return;
+  welcomeError.value = "";
+  try {
+    const p = await invoke<string | null>("pick_folder");
+    if (!p) return;
+    welcomeInitBusy.value = true;
+    await invoke<string>("git_init", { path: p });
+    repoPath.value = p;
+    await refreshAll();
+    await refreshBranches();
+    await refreshAuth();
+    showResult(i18n.t("git.initSuccessTitle"), i18n.t("git.initSuccess"));
+    await startLoginWizard();
+  } catch (e) {
+    welcomeError.value = String(e);
+  } finally {
+    welcomeInitBusy.value = false;
+  }
+}
+
+async function welcomeEnterRepo() {
+  if (welcomeBusy.value) return;
+  welcomeError.value = "";
+  try {
+    const p = await invoke<string | null>("pick_folder");
+    if (!p) return;
+    welcomeBusy.value = true;
+    repoSettingsPath.value = p;
+    repoSettingsNotGit.value = false;
+    repoSettingsError.value = "";
+    await confirmRepoSettings();
+    if (repoSettingsNotGit.value) {
+      repoSettingsDialog.value = true;
+    }
+  } catch (e) {
+    welcomeError.value = String(e);
+  } finally {
+    welcomeBusy.value = false;
+  }
 }
 
 onMounted(async () => {
@@ -522,9 +758,17 @@ onMounted(async () => {
     gitInstalled.value = await invoke<boolean>("check_git");
     authState.value = await invoke<GhAuthState>("gh_auth_state");
     ghInstalled.value = authState.value?.gh_installed ?? false;
-    if (gitInstalled.value && ghInstalled.value) {
-      repoPath.value = await invoke<string>("git_default_dir");
-      await detectRepo();
+    const savedRepo = localStorage.getItem("git.repoPath");
+    if (savedRepo) {
+      const root = await invoke<string | null>("git_repo_root", { path: savedRepo });
+      if (root) {
+        repoPath.value = root;
+        await refreshAll();
+        await refreshBranches();
+        await checkLoginNeeded();
+      } else {
+        localStorage.removeItem("git.repoPath");
+      }
     }
   } catch (e) {
     console.error(e);
@@ -585,21 +829,97 @@ onMounted(async () => {
     </div>
 
     <template v-else>
+      <div v-if="!repoPath" class="git-welcome">
+        <div class="git-welcome-account">
+          <WinTextBlock
+            v-if="authState?.logged_in && authState?.user"
+            :Text="i18n.t('git.loggedAs', { user: authState.user })"
+            Style="font-size:13px"
+            Foreground="secondary"
+          />
+          <WinTextBlock
+            v-else
+            :Text="i18n.t('git.notLoggedIn')"
+            Style="font-size:13px"
+            Foreground="secondary"
+          />
+          <WinButton
+            :IsEnabled="!welcomeBusy && !welcomeInitBusy && !logoutBusy"
+            @click="startLoginWizard"
+            :Title="i18n.t('git.switchAccount')"
+            Style="padding:4px;min-height:28px"
+          >
+            <AppIcon name="switchAccount" :size="16" />
+          </WinButton>
+          <WinButton
+            v-if="authState?.logged_in"
+            :IsEnabled="!welcomeBusy && !welcomeInitBusy && !logoutBusy"
+            @click="logoutGithub"
+            :Title="logoutBusy ? i18n.t('git.loggingOut') : i18n.t('git.logout')"
+            Style="padding:4px;min-height:28px"
+          >
+            <AppIcon name="logout" :size="16" />
+          </WinButton>
+        </div>
+
+        <div class="git-welcome-hero">
+          <div class="git-welcome-icon">
+            <AppIcon name="git" :size="40" />
+          </div>
+          <WinTextBlock
+            :Text="i18n.t('git.welcomeTitle')"
+            Style="font-size:22px;font-weight:600"
+          />
+          <WinTextBlock
+            :Text="i18n.t('git.welcomeSubtitle')"
+            Style="font-size:13px"
+            Foreground="secondary"
+          />
+          <div class="git-welcome-actions">
+            <WinButton
+              :Content="welcomeInitBusy ? i18n.t('git.repoSettingsInitBusy') : i18n.t('git.welcomeCreate')"
+              Style="AccentButtonStyle"
+              @click="welcomeCreateRepo"
+              :IsEnabled="!welcomeInitBusy && !welcomeBusy"
+            />
+            <WinButton
+              :Content="i18n.t('git.welcomeEnter')"
+              @click="welcomeEnterRepo"
+              :IsEnabled="!welcomeBusy && !welcomeInitBusy"
+            />
+          </div>
+          <div v-if="welcomeInitBusy || welcomeBusy" class="git-welcome-busy">
+            <WinProgressRing :IsActive="true" :IsIndeterminate="true" :Width="20" :Height="20" />
+            <WinTextBlock
+              :Text="welcomeInitBusy ? i18n.t('git.repoSettingsInitBusy') : i18n.t('git.repoSettingsBusy')"
+              Style="font-size:12px;opacity:.7"
+            />
+          </div>
+          <div v-if="welcomeError" class="git-welcome-error">
+            {{ welcomeError }}
+          </div>
+        </div>
+      </div>
+
+      <template v-else>
       <div class="git-toolbar">
-        <WinTextBox
-          :Text="repoPath"
-          :PlaceholderText="i18n.t('git.repoPath')"
-          @update:Text="(v: string) => (repoPath = v)"
-          Style="flex:1;min-width:220px"
-        />
+        <div class="git-repo-name">
+          <AppIcon name="git" :size="18" />
+          <WinTextBlock
+            v-if="repoName"
+            :Text="repoName"
+            Style="font-size:14px;font-weight:600"
+          />
+          <WinTextBlock
+            v-else
+            :Text="i18n.t('git.repoPlaceholder')"
+            Style="font-size:14px"
+            Foreground="secondary"
+          />
+        </div>
         <WinButton
-          :Content="i18n.t('git.browse')"
-          @click="browseFolder"
-          :IsEnabled="!loading"
-        />
-        <WinButton
-          :Content="i18n.t('git.detect')"
-          @click="detectRepo"
+          :Content="i18n.t('git.repoSettings')"
+          @click="openRepoSettings"
           :IsEnabled="!loading"
         />
         <WinButton
@@ -610,7 +930,7 @@ onMounted(async () => {
         <div class="git-account-area">
           <WinTextBlock
             v-if="authState?.logged_in && authState?.user"
-            :Text="i18n.t('git.loggedAs', { user: authState.user, host: authState.host || 'github.com' })"
+            :Text="i18n.t('git.loggedAs', { user: authState.user })"
             Style="font-size:12px"
             Foreground="secondary"
           />
@@ -640,54 +960,12 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div class="git-clone-box">
-        <WinTextBox
-          :Text="cloneUrl"
-          :PlaceholderText="i18n.t('git.cloneUrlPlaceholder')"
-          @update:Text="(v: string) => (cloneUrl = v)"
-          Style="flex:1;min-width:200px"
-        />
-        <WinTextBox
-          :Text="cloneTarget"
-          :PlaceholderText="i18n.t('git.cloneTargetPlaceholder')"
-          @update:Text="(v: string) => (cloneTarget = v)"
-          Style="flex:1;min-width:160px"
-        />
-        <WinButton
-          :Content="i18n.t('git.browse')"
-          @click="browseCloneTarget"
-          :IsEnabled="!cloning"
-        />
-        <WinButton
-          :Content="i18n.t('git.clone')"
-          Style="AccentButtonStyle"
-          @click="cloneRepo"
-          :IsEnabled="!cloning && !!cloneUrl && !!cloneTarget"
-        />
-      </div>
-
       <div v-if="repoError === 'norepo'" class="git-card git-warn">
         <WinTextBlock :Text="i18n.t('git.noRepo')" Style="color:var(--system-error, #c42b1c)" />
       </div>
       <div v-else-if="repoError" class="git-card git-warn">
         <WinTextBlock :Text="repoError" Style="color:var(--system-error, #c42b1c)" />
       </div>
-      <div v-if="notice === 'ok'" class="git-card git-ok">
-        <WinTextBlock :Text="i18n.t('git.commitSuccess')" Style="color:var(--accent, #005fb8)" />
-      </div>
-      <div v-if="notice === 'pushed'" class="git-card git-ok">
-        <WinTextBlock :Text="i18n.t('git.pushSuccess')" Style="color:var(--accent, #005fb8)" />
-      </div>
-      <div v-if="notice === 'cloned'" class="git-card git-ok">
-        <WinTextBlock :Text="i18n.t('git.cloneSuccess')" Style="color:var(--accent, #005fb8)" />
-      </div>
-      <div v-if="notice === 'pulled'" class="git-card git-ok">
-        <WinTextBlock :Text="i18n.t('git.pullSuccess')" Style="color:var(--accent, #005fb8)" />
-      </div>
-      <div v-if="notice === 'loggedOut'" class="git-card git-ok">
-        <WinTextBlock :Text="i18n.t('git.logoutSuccess')" Style="color:var(--accent, #005fb8)" />
-      </div>
-
       <template v-if="status">
         <WinSelectorBar
           class="git-selector"
@@ -829,12 +1107,55 @@ onMounted(async () => {
           <div v-if="!commits.length" class="git-hint">
             <WinTextBlock :Text="i18n.t('git.empty')" Style="opacity:.6" />
           </div>
-          <div v-for="c in commits" :key="c.hash" class="git-commit-row">
-            <span class="git-commit-hash">{{ c.short_hash }}</span>
-            <span class="git-commit-msg">{{ c.message }}</span>
-            <span class="git-commit-meta">{{ c.author }} · {{ c.date }}</span>
+          <div
+            v-for="c in commits"
+            :key="c.hash"
+            class="git-commit-item"
+            :class="{ expanded: expandedCommit === c.hash }"
+          >
+            <div class="git-commit-row">
+              <button
+                class="git-commit-expand-btn"
+                :aria-expanded="expandedCommit === c.hash"
+                @click="toggleCommitExpand(c)"
+                :title="i18n.t('git.commitExpand')"
+              >
+                <span class="git-commit-chevron" :class="{ rotated: expandedCommit === c.hash }">&#xE76C;</span>
+              </button>
+              <span class="git-commit-hash">{{ c.short_hash }}</span>
+              <span class="git-commit-msg" @click="toggleCommitExpand(c)">{{ c.message }}</span>
+              <span class="git-commit-meta">{{ c.author }} · {{ c.date }}</span>
+            </div>
+            <div v-if="expandedCommit === c.hash" class="git-commit-detail">
+              <div class="git-commit-detail-section">
+                <div class="git-commit-detail-label">{{ i18n.t('git.commitHash') }}</div>
+                <div class="git-commit-detail-value git-commit-detail-hash">{{ c.hash }}</div>
+              </div>
+              <div class="git-commit-detail-section">
+                <div class="git-commit-detail-label">{{ i18n.t('git.commitAuthor') }}</div>
+                <div class="git-commit-detail-value">{{ c.author }}</div>
+              </div>
+              <div class="git-commit-detail-section">
+                <div class="git-commit-detail-label">{{ i18n.t('git.commitDate') }}</div>
+                <div class="git-commit-detail-value">{{ c.date }}</div>
+              </div>
+              <div v-if="c.body" class="git-commit-detail-section">
+                <div class="git-commit-detail-label">{{ i18n.t('git.commitBodyLabel') }}</div>
+                <pre class="git-commit-detail-body">{{ c.body }}</pre>
+              </div>
+              <div v-else class="git-commit-detail-empty">{{ i18n.t('git.commitBodyEmpty') }}</div>
+              <div class="git-commit-detail-actions">
+                <WinButton
+                  :Content="i18n.t('git.revert')"
+                  @click="openRevertDialog(c)"
+                  :IsEnabled="!busy"
+                  Style="font-size:12px"
+                />
+              </div>
+            </div>
           </div>
         </section>
+      </template>
       </template>
     </template>
 
@@ -859,6 +1180,127 @@ onMounted(async () => {
     />
 
     <WinContentDialog
+      v-model:IsOpen="resultDialog"
+      :Title="resultDialogTitle"
+      :Content="resultDialogContent"
+      :CloseButtonText="i18n.t('git.resultClose')"
+    />
+
+    <WinContentDialog
+      v-model:IsOpen="revertDialog"
+      :Title="i18n.t('git.revertTitle')"
+      :PrimaryButtonText="i18n.t('git.revertConfirm')"
+      :CloseButtonText="i18n.t('git.revertCancel')"
+      :IsPrimaryButtonEnabled="!revertBusy"
+      DefaultButton="Close"
+      @PrimaryButtonClick="confirmRevert"
+    >
+      <div class="git-revert-body">
+        <div class="git-revert-info">
+          <div><strong>{{ revertTarget?.short_hash }}</strong></div>
+          <div class="git-revert-msg">{{ revertTarget?.message }}</div>
+          <div class="git-revert-meta">{{ revertTarget?.author }} · {{ revertTarget?.date }}</div>
+        </div>
+        <WinCheckBox
+          v-model="revertNoCommit"
+          :Content="i18n.t('git.revertNoCommit')"
+        />
+        <div v-if="revertError" class="git-revert-error">
+          {{ revertError }}
+        </div>
+        <div v-if="revertBusy" class="git-revert-busy">
+          <WinProgressRing :IsActive="true" :IsIndeterminate="true" :Width="20" :Height="20" />
+          <WinTextBlock :Text="i18n.t('git.revertBusy')" Style="font-size:12px;opacity:.7" />
+        </div>
+      </div>
+    </WinContentDialog>
+
+    <WinContentDialog
+      v-model:IsOpen="repoSettingsDialog"
+      :Title="i18n.t('git.repoSettingsTitle')"
+      :PrimaryButtonText="repoSettingsNotGit ? i18n.t('git.repoSettingsInit') : i18n.t('git.repoSettingsConfirm')"
+      :SecondaryButtonText="repoSettingsNotGit ? i18n.t('git.repoSettingsReselect') : ''"
+      :CloseButtonText="i18n.t('git.repoSettingsCancel')"
+      :IsPrimaryButtonEnabled="
+        repoSettingsNotGit
+          ? !repoSettingsInitBusy && !repoSettingsBusy && !!repoSettingsPath.trim()
+          : !repoSettingsBusy && !cloning && !!repoSettingsPath.trim()
+      "
+      DefaultButton="Primary"
+      @PrimaryButtonClick="repoSettingsNotGit ? initRepoAndEnterWizard() : confirmRepoSettings()"
+      @SecondaryButtonClick="resetRepoSettingsSelection"
+    >
+      <div class="git-repo-settings-body">
+        <div class="git-repo-settings-row">
+          <label>{{ i18n.t('git.repoSettingsPath') }}</label>
+          <div class="git-repo-settings-input-row">
+            <WinTextBox
+              :Text="repoSettingsPath"
+              :PlaceholderText="i18n.t('git.repoPlaceholder')"
+              @update:Text="(v: string) => (repoSettingsPath = v)"
+              Style="flex:1"
+            />
+            <WinButton
+              :Content="i18n.t('git.browse')"
+              @click="browseRepoSettings"
+              :IsEnabled="!repoSettingsBusy && !cloning"
+            />
+          </div>
+        </div>
+
+        <div class="git-repo-settings-divider"></div>
+
+        <div class="git-repo-settings-row">
+          <label>{{ i18n.t('git.cloneSection') }}</label>
+          <div class="git-repo-settings-input-row">
+            <WinTextBox
+              :Text="cloneUrl"
+              :PlaceholderText="i18n.t('git.cloneUrlPlaceholder')"
+              @update:Text="(v: string) => (cloneUrl = v)"
+              Style="flex:1"
+            />
+          </div>
+          <div class="git-repo-settings-input-row">
+            <WinTextBox
+              :Text="cloneTarget"
+              :PlaceholderText="i18n.t('git.cloneTargetPlaceholder')"
+              @update:Text="(v: string) => (cloneTarget = v)"
+              Style="flex:1"
+            />
+            <WinButton
+              :Content="i18n.t('git.browse')"
+              @click="browseCloneTarget"
+              :IsEnabled="!cloning && !repoSettingsBusy"
+            />
+            <WinButton
+              :Content="i18n.t('git.clone')"
+              Style="AccentButtonStyle"
+              @click="cloneRepo"
+              :IsEnabled="!cloning && !repoSettingsBusy && !!cloneUrl && !!cloneTarget"
+            />
+          </div>
+        </div>
+
+        <div v-if="repoSettingsError" class="git-repo-settings-error">
+          {{ repoSettingsError }}
+        </div>
+        <div v-if="repoSettingsBusy || cloning || repoSettingsInitBusy" class="git-repo-settings-busy">
+          <WinProgressRing :IsActive="true" :IsIndeterminate="true" :Width="20" :Height="20" />
+          <WinTextBlock
+            :Text="
+              repoSettingsInitBusy
+                ? i18n.t('git.repoSettingsInitBusy')
+                : cloning
+                  ? i18n.t('git.cloning')
+                  : i18n.t('git.repoSettingsBusy')
+            "
+            Style="font-size:12px;opacity:.7"
+          />
+        </div>
+      </div>
+    </WinContentDialog>
+
+    <WinContentDialog
       v-model:IsOpen="commitPushDialog"
       :Title="i18n.t('git.commitPushTitle')"
       :PrimaryButtonText="commitPushOnly ? i18n.t('git.commitPushConfirmOnly') : i18n.t('git.commitPushConfirm')"
@@ -875,6 +1317,16 @@ onMounted(async () => {
             :PlaceholderText="i18n.t('git.commitPlaceholder')"
             @update:Text="(v: string) => (commitPushMsg = v)"
             Style="width:100%"
+          />
+        </div>
+        <div class="git-commit-push-row">
+          <label>{{ i18n.t('git.commitBody') }}</label>
+          <WinTextBox
+            :Text="commitPushBody"
+            :PlaceholderText="i18n.t('git.commitBodyPlaceholder')"
+            :AcceptsReturn="true"
+            @update:Text="(v: string) => (commitPushBody = v)"
+            Style="width:100%;min-height:80px"
           />
         </div>
         <WinCheckBox
@@ -955,6 +1407,82 @@ onMounted(async () => {
   padding: 48px 0;
 }
 
+.git-welcome {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 12px 0 40px;
+}
+
+.git-welcome-account {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.06));
+  padding-bottom: 10px;
+}
+
+html.theme-dark .git-welcome-account {
+  border-bottom-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.07));
+}
+
+.git-welcome-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 32px 20px;
+  border-radius: 12px;
+  background: var(--LayerFillColorDefaultBrush, rgba(255, 255, 255, 0.5));
+  border: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.08));
+}
+
+html.theme-dark .git-welcome-hero {
+  background: var(--LayerFillColorDefaultBrush, rgba(255, 255, 255, 0.03));
+  border-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.07));
+}
+
+.git-welcome-icon {
+  width: 72px;
+  height: 72px;
+  border-radius: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--AccentButtonBackground, #005fb8);
+  background: color-mix(in srgb, var(--AccentButtonBackground, #005fb8) 14%, transparent);
+}
+
+html.theme-dark .git-welcome-icon {
+  color: #4cc2ff;
+  background: color-mix(in srgb, #4cc2ff 16%, transparent);
+}
+
+.git-welcome-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.git-welcome-busy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.git-welcome-error {
+  font-size: 12px;
+  color: var(--system-error, #c42b1c);
+  word-break: break-word;
+  text-align: center;
+  max-width: 460px;
+}
+
 .git-toolbar {
   position: sticky;
   top: 0;
@@ -991,6 +1519,31 @@ html.theme-dark .git-account-area {
   padding: 4px 8px;
   min-height: 28px;
   line-height: 1;
+}
+
+.git-repo-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--ControlFillColorSecondaryBrush, rgba(0, 0, 0, 0.03));
+  color: var(--AccentButtonBackground, #005fb8);
+}
+
+html.theme-dark .git-repo-name {
+  background: var(--ControlFillColorSecondaryBrush, rgba(255, 255, 255, 0.05));
+  color: #4cc2ff;
+}
+
+.git-repo-name .win-textblock {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .git-selector {
@@ -1141,23 +1694,6 @@ html.theme-dark .git-file-badge {
   flex-shrink: 0;
 }
 
-.git-clone-box {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-top: 8px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: var(--CardBackgroundFillColorDefaultBrush, rgba(255, 255, 255, 0.7));
-  border: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.06));
-}
-
-html.theme-dark .git-clone-box {
-  background: var(--CardBackgroundFillColorDefaultBrush, rgba(32, 32, 32, 0.6));
-  border-color: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.07));
-}
-
 .git-history-actions {
   display: flex;
   gap: 8px;
@@ -1233,12 +1769,118 @@ html.theme-dark .git-commit-push-row label {
   gap: 8px;
 }
 
+.git-repo-settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.git-repo-settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.git-repo-settings-row label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--TextFillColorPrimaryBrush, rgba(0, 0, 0, 0.9));
+}
+
+html.theme-dark .git-repo-settings-row label {
+  color: var(--TextFillColorPrimaryBrush, rgba(255, 255, 255, 0.9));
+}
+
+.git-repo-settings-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.git-repo-settings-divider {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.08));
+}
+
+html.theme-dark .git-repo-settings-divider {
+  background: var(--CardStrokeColorDefaultBrush, rgba(255, 255, 255, 0.08));
+}
+
+.git-repo-settings-error {
+  font-size: 12px;
+  color: var(--system-error, #c42b1c);
+  word-break: break-word;
+}
+
+.git-repo-settings-busy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.git-commit-item {
+  border-radius: 6px;
+  transition: background 0.15s ease;
+}
+
+.git-commit-item + .git-commit-item {
+  margin-top: 2px;
+}
+
+.git-commit-item.expanded {
+  background: var(--ControlFillColorSecondaryBrush, rgba(0, 0, 0, 0.04));
+}
+
+html.theme-dark .git-commit-item.expanded {
+  background: var(--ControlFillColorSecondaryBrush, rgba(255, 255, 255, 0.05));
+}
+
 .git-commit-row {
   display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 4px 0;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
   font-size: 13px;
+}
+
+.git-commit-expand-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px;
+  color: var(--TextFillColorSecondaryBrush, rgba(0, 0, 0, 0.6));
+  font-family: "WinUIOnWebIcons", "Segoe Fluent Icons", "Segoe MDL2 Assets", monospace;
+  font-size: 12px;
+  transition: background 0.12s ease;
+}
+
+.git-commit-expand-btn:hover {
+  background: var(--ControlFillColorTertiaryBrush, rgba(0, 0, 0, 0.06));
+}
+
+html.theme-dark .git-commit-expand-btn {
+  color: var(--TextFillColorSecondaryBrush, rgba(255, 255, 255, 0.6));
+}
+
+html.theme-dark .git-commit-expand-btn:hover {
+  background: var(--ControlFillColorTertiaryBrush, rgba(255, 255, 255, 0.08));
+}
+
+.git-commit-chevron {
+  display: inline-block;
+  transition: transform 0.18s ease;
+}
+
+.git-commit-chevron.rotated {
+  transform: rotate(90deg);
 }
 
 .git-commit-hash {
@@ -1257,12 +1899,83 @@ html.theme-dark .git-commit-hash {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
+  user-select: none;
 }
 
 .git-commit-meta {
   flex-shrink: 0;
   font-size: 12px;
   opacity: 0.65;
+}
+
+.git-commit-detail {
+  padding: 8px 12px 12px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.git-commit-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.git-commit-detail-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--TextFillColorSecondaryBrush, rgba(0, 0, 0, 0.6));
+}
+
+html.theme-dark .git-commit-detail-label {
+  color: var(--TextFillColorSecondaryBrush, rgba(255, 255, 255, 0.6));
+}
+
+.git-commit-detail-value {
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.git-commit-detail-hash {
+  font-family: "Cascadia Code", "Consolas", monospace;
+  color: var(--AccentButtonBackground, #005fb8);
+}
+
+html.theme-dark .git-commit-detail-hash {
+  color: #4cc2ff;
+}
+
+.git-commit-detail-body {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--ControlFillColorDefaultBrush, rgba(0, 0, 0, 0.03));
+  border-radius: 6px;
+  color: var(--TextFillColorPrimaryBrush, rgba(0, 0, 0, 0.9));
+}
+
+html.theme-dark .git-commit-detail-body {
+  background: var(--ControlFillColorDefaultBrush, rgba(255, 255, 255, 0.03));
+  color: var(--TextFillColorPrimaryBrush, rgba(255, 255, 255, 0.9));
+}
+
+.git-commit-detail-empty {
+  font-size: 12px;
+  opacity: 0.55;
+  font-style: italic;
+}
+
+.git-commit-detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 .wiz-container {

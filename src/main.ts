@@ -6,6 +6,8 @@ import { useTheme } from "./composables/useTheme";
 import "@winui/styles/theme.css";
 import "@winui/styles/animations.css";
 
+window.addEventListener("contextmenu", (e) => e.preventDefault());
+
 window.addEventListener("error", (e) => {
   const err = document.getElementById("app-error");
   if (err) {

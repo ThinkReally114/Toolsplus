@@ -6,6 +6,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ToolsPlus</title>
     <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background-color: #F3F3F3;
+      }
+      html.theme-dark, html.theme-dark body {
+        background-color: #202020;
+      }
       #app-loading {
         display: flex;
         align-items: center;
@@ -24,6 +32,20 @@
         white-space: pre-wrap;
       }
     </style>
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem("toolsplus-theme");
+          var mode = saved === "light" || saved === "dark" || saved === "system" ? saved : "system";
+          var resolved = mode;
+          if (mode === "system") {
+            resolved = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+          }
+          document.documentElement.classList.add("theme-" + resolved);
+          document.documentElement.setAttribute("data-theme", resolved);
+        } catch (e) {}
+      })();
+    </script>
   </head>
 
   <body>

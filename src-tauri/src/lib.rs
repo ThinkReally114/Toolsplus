@@ -767,6 +767,8 @@ struct ProcessInfo {
     status: String,
     icon: Option<String>,
     is_self: bool,
+    is_related: bool,
+    is_system: bool,
 }
 
 /// exe 图标缓存：相同路径只提取一次
@@ -980,6 +982,75 @@ fn adler32(data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
+/// 调用 Windows SCM API 枚举所有正在运行的服务进程 PID
+fn query_service_pids() -> std::collections::HashSet<u32> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
+        SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_STATE_ALL, SERVICE_WIN32,
+    };
+
+    let mut pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    let scm = unsafe {
+        OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ENUMERATE_SERVICE)
+    };
+    let Ok(scm) = scm else { return pids; };
+
+    let mut bytes_needed: u32 = 0;
+    let mut services_returned: u32 = 0;
+    let mut resume_handle: u32 = 0;
+
+    let _ = unsafe {
+        EnumServicesStatusExW(
+            scm,
+            SC_ENUM_PROCESS_INFO,
+            SERVICE_WIN32,
+            SERVICE_STATE_ALL,
+            None,
+            &mut bytes_needed,
+            &mut services_returned,
+            Some(&mut resume_handle),
+            PCWSTR::null(),
+        )
+    };
+
+    if bytes_needed == 0 {
+        unsafe { let _ = CloseServiceHandle(scm); };
+        return pids;
+    }
+
+    let mut buffer: Vec<u8> = vec![0u8; bytes_needed as usize];
+    let ok = unsafe {
+        EnumServicesStatusExW(
+            scm,
+            SC_ENUM_PROCESS_INFO,
+            SERVICE_WIN32,
+            SERVICE_STATE_ALL,
+            Some(buffer.as_mut_slice()),
+            &mut bytes_needed,
+            &mut services_returned,
+            Some(&mut resume_handle),
+            PCWSTR::null(),
+        )
+    };
+
+    if ok.is_ok() && services_returned > 0 {
+        let entries_ptr = buffer.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW;
+        for i in 0..services_returned as usize {
+            let entry = unsafe { &*entries_ptr.add(i) };
+            let pid = entry.ServiceStatusProcess.dwProcessId;
+            if pid != 0 {
+                pids.insert(pid);
+            }
+        }
+    }
+
+    unsafe { let _ = CloseServiceHandle(scm); };
+
+    pids
+}
+
 /// 查询进程列表（不含图标，图标由 process_icons 异步补充）
 #[tauri::command]
 fn list_processes() -> Vec<ProcessInfo> {
@@ -990,6 +1061,26 @@ fn list_processes() -> Vec<ProcessInfo> {
 
     let total_mem = sys.total_memory();
     let self_pid = std::process::id();
+
+    let mut related_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    related_pids.insert(self_pid);
+    let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+    queue.push_back(self_pid);
+    while let Some(parent_pid) = queue.pop_front() {
+        for (pid, p) in sys.processes() {
+            let pid_u32 = pid.as_u32();
+            if related_pids.contains(&pid_u32) {
+                continue;
+            }
+            if p.parent().map(|pp| pp.as_u32() == parent_pid).unwrap_or(false) {
+                related_pids.insert(pid_u32);
+                queue.push_back(pid_u32);
+            }
+        }
+    }
+
+    let service_pids = query_service_pids();
+
     let mut entries: Vec<ProcessInfo> = sys
         .processes()
         .iter()
@@ -1007,15 +1098,21 @@ fn list_processes() -> Vec<ProcessInfo> {
                 _ => "unknown",
             }
             .to_string();
+            let pid_u32 = pid.as_u32();
+            let is_self = pid_u32 == self_pid;
+            let is_related = !is_self && related_pids.contains(&pid_u32);
+            let is_system = !is_self && !is_related && service_pids.contains(&pid_u32);
             ProcessInfo {
-                pid: pid.as_u32(),
+                pid: pid_u32,
                 name: p.name().to_string_lossy().to_string(),
                 cpu_usage: p.cpu_usage(),
                 memory: mem,
                 memory_percent: mem_percent,
                 status,
                 icon: None,
-                is_self: pid.as_u32() == self_pid,
+                is_self,
+                is_related,
+                is_system,
             }
         })
         .collect();
@@ -1328,12 +1425,14 @@ struct GitCommit {
     author: String,
     date: String,
     message: String,
+    body: String,
 }
 
 /// 查询提交历史（最近 limit 条）
 #[command]
 fn git_log(repo: String, limit: u32) -> Result<Vec<GitCommit>, String> {
-    let fmt = "%H%x1f%h%x1f%an%x1f%ad%x1f%s";
+    // %B 是完整 commit message（subject + body），用 %x00 分隔字段，用 %x1e 分隔记录
+    let fmt = "%H%x1f%h%x1f%an%x1f%ad%x1f%B%x1e";
     let limit_str = format!("-{}", limit.max(1));
     let (ok, out, err) = run_git(
         &repo,
@@ -1350,18 +1449,30 @@ fn git_log(repo: String, limit: u32) -> Result<Vec<GitCommit>, String> {
         return Err(err.trim().to_string());
     }
     let mut commits = Vec::new();
-    for line in out.lines() {
-        if line.trim().is_empty() {
+    for record in out.split('\u{1e}') {
+        let record = record.trim_start_matches('\n').trim();
+        if record.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.split('\u{1f}').collect();
+        let parts: Vec<&str> = record.splitn(5, '\u{1f}').collect();
         if parts.len() == 5 {
+            let full = parts[4];
+            // 完整 message 第一行是 subject，其余是 body
+            let mut lines = full.lines();
+            let subject = lines.next().unwrap_or("").trim().to_string();
+            let body: String = lines
+                .skip_while(|l| l.trim().is_empty()) // 跳过 subject 和 body 之间的空行
+                .collect::<Vec<&str>>()
+                .join("\n")
+                .trim()
+                .to_string();
             commits.push(GitCommit {
                 hash: parts[0].to_string(),
                 short_hash: parts[1].to_string(),
                 author: parts[2].to_string(),
                 date: parts[3].to_string(),
-                message: parts[4].to_string(),
+                message: subject,
+                body,
             });
         }
     }
@@ -1396,7 +1507,7 @@ fn git_unstage(repo: String, paths: Vec<String>) -> Result<(), String> {
 
 /// 提交（git commit -m）
 #[command]
-fn git_commit(repo: String, message: String, branch: Option<String>) -> Result<String, String> {
+fn git_commit(repo: String, message: String, body: Option<String>, branch: Option<String>) -> Result<String, String> {
     if message.trim().is_empty() {
         return Err("提交信息不能为空".to_string());
     }
@@ -1421,7 +1532,31 @@ fn git_commit(repo: String, message: String, branch: Option<String>) -> Result<S
             }
         }
     }
-    let (ok, out, err) = run_git(&repo, &["commit", "-m", message.trim()]);
+    // 组装提交信息：标题 + 空行 + 详细信息
+    let full_message = match body {
+        Some(b) if !b.trim().is_empty() => format!("{}\n\n{}", message.trim(), b.trim()),
+        _ => message.trim().to_string(),
+    };
+    let (ok, out, err) = run_git(&repo, &["commit", "-m", &full_message]);
+    if ok {
+        Ok(out.trim().to_string())
+    } else {
+        Err(err.trim().to_string())
+    }
+}
+
+/// 撤回指定提交（git revert）
+#[command]
+fn git_revert(repo: String, hash: String, no_commit: Option<bool>) -> Result<String, String> {
+    if hash.trim().is_empty() {
+        return Err("提交哈希不能为空".to_string());
+    }
+    let mut args = vec!["revert"];
+    if no_commit.unwrap_or(false) {
+        args.push("--no-commit");
+    }
+    args.push(hash.trim());
+    let (ok, out, err) = run_git(&repo, &args);
     if ok {
         Ok(out.trim().to_string())
     } else {
@@ -1520,6 +1655,34 @@ async fn git_clone(url: String, target_dir: String) -> Result<String, String> {
     task
 }
 
+/// 在指定路径初始化一个 Git 仓库（git init）
+#[command]
+async fn git_init(path: String) -> Result<String, String> {
+    use std::path::Path;
+    use std::os::windows::process::CommandExt;
+    if !Path::new(&path).exists() {
+        return Err("目标路径不存在".to_string());
+    }
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = Command::new("git")
+            .args(["init"])
+            .current_dir(&path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("git init 执行失败: {e}"))?;
+        if out.status.success() {
+            Ok(path.clone())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    task
+}
+
 /// 弹出系统文件夹选择对话框，返回选中路径
 #[command]
 async fn pick_folder() -> Result<Option<String>, String> {
@@ -1579,105 +1742,47 @@ async fn gh_auth_state() -> GhAuthState {
             host: String::new(),
         };
     }
-    let combined = tauri::async_runtime::spawn_blocking(|| {
+    // 直接用 gh api user --jq .login 作为权威判断
+    // 成功=已登录+用户名，失败=未登录（避免解析 gh auth status 的 ✓ 前缀格式问题）
+    let api_result = tauri::async_runtime::spawn_blocking(|| {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         use std::sync::mpsc;
         use std::time::Duration;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // 用 channel + recv_timeout 实现 3 秒超时，避免 gh 启动慢卡住 UI
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let out = Command::new("gh")
-                .args(["auth", "status"])
+                .args(["api", "user", "--jq", ".login"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
             let _ = tx.send(out);
         });
-        match rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(o)) => format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            ),
-            _ => String::new(),
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(o)) if o.status.success() => {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            }
+            _ => None,
         }
     })
     .await
-    .unwrap_or_default();
-    if combined.is_empty() {
+    .unwrap_or(None);
+
+    if let Some(user) = api_result {
         return GhAuthState {
             gh_installed: true,
-            logged_in: false,
-            user: String::new(),
-            host: String::new(),
+            logged_in: true,
+            user,
+            host: "github.com".to_string(),
         };
-    }
-    let logged_in = combined.contains("Logged in to")
-        || combined.contains("Logged in to github.com")
-        || combined.to_lowercase().contains("token:");
-    // 解析用户名：支持 "Logged in to github.com account USERNAME" 和 "account: USERNAME" 两种格式
-    let mut user = combined
-        .lines()
-        .find_map(|l| {
-            let l = l.trim();
-            l.strip_prefix("Logged in to")
-                .and_then(|rest| {
-                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                    // "Logged in to github.com account USERNAME (keyring)"
-                    if let Some(idx) = parts.iter().position(|s| *s == "account") {
-                        parts.get(idx + 1).map(|s| s.trim_matches(|c| c == '(' || c == ')').to_string())
-                    } else if parts.len() >= 3 {
-                        Some(parts[2].trim_matches(|c| c == '(' || c == ')').to_string())
-                    } else {
-                        None
-                    }
-                })
-        })
-        .unwrap_or_default();
-    let host = combined
-        .lines()
-        .find_map(|l| {
-            let l = l.trim();
-            l.strip_prefix("Logged in to")
-                .and_then(|rest| rest.split_whitespace().next().map(|s| s.to_string()))
-        })
-        .unwrap_or_default();
-    // 如果已登录但 user 为空，用 gh api user 兜底获取
-    if logged_in && user.is_empty() {
-        user = tauri::async_runtime::spawn_blocking(|| {
-            use std::os::windows::process::CommandExt;
-            use std::process::{Command, Stdio};
-            use std::sync::mpsc;
-            use std::time::Duration;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let out = Command::new("gh")
-                    .args(["api", "user", "--jq", ".login"])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .output();
-                let _ = tx.send(out);
-            });
-            match rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(o)) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).trim().to_string()
-                }
-                _ => String::new(),
-            }
-        })
-        .await
-        .unwrap_or_default();
     }
     GhAuthState {
         gh_installed: true,
-        logged_in,
-        user,
-        host,
+        logged_in: false,
+        user: String::new(),
+        host: String::new(),
     }
 }
 
@@ -1761,26 +1866,102 @@ async fn gh_logout() -> Result<String, String> {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // gh auth logout 不支持 --force，用 --hostname 指定 host 非交互登出
-        let out = Command::new("gh")
-            .args(["auth", "logout", "--hostname", "github.com"])
+        // 先用 gh auth status --json 获取所有已登录账号（gh 2.40+ 支持多账号）
+        // 没有账号或命令失败时直接返回成功（视为已登出）
+        let status_out = Command::new("gh")
+            .args(["auth", "status", "--json", "host,oauthToken,accounts"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
             .output()
-            .map_err(|e| format!("执行 gh auth logout 失败: {e}"))?;
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if out.status.success() {
-            Ok(if stdout.is_empty() { stderr } else { stdout })
-        } else {
-            // gh 在未登录状态下 logout 会返回非零，视为已登出
-            let combined = if stdout.is_empty() { stderr } else { stdout };
-            if combined.to_lowercase().contains("not logged") {
-                Ok("未登录，无需登出".to_string())
-            } else {
-                Err(combined)
+            .map_err(|e| format!("执行 gh auth status 失败: {e}"))?;
+
+        let mut logged_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if status_out.status.success() {
+            let status_json = String::from_utf8_lossy(&status_out.stdout).trim().to_string();
+            // 简易解析：从 JSON 中找 "host":"..." 字段
+            // 避免引入 serde_json 依赖，直接字符串查找
+            let mut rest = status_json.as_str();
+            while let Some(pos) = rest.find("\"host\"") {
+                rest = &rest[pos + 6..];
+                if let Some(colon) = rest.find(':') {
+                    rest = &rest[colon + 1..];
+                    if let Some(start) = rest.find('"') {
+                        rest = &rest[start + 1..];
+                        if let Some(end) = rest.find('"') {
+                            logged_hosts.insert(rest[..end].to_string());
+                            rest = &rest[end + 1..];
+                        }
+                    }
+                }
             }
+        }
+
+        // fallback：如果没解析出 host，默认尝试登出 github.com
+        if logged_hosts.is_empty() {
+            logged_hosts.insert("github.com".to_string());
+        }
+
+        let mut last_msg = String::new();
+        let mut any_err = false;
+        for host in &logged_hosts {
+            let out = Command::new("gh")
+                .args(["auth", "logout", "--hostname", host])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| format!("执行 gh auth logout 失败 ({host}): {e}"))?;
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let combined = if stdout.is_empty() { stderr } else { stdout };
+            if !combined.is_empty() {
+                last_msg = combined.clone();
+            }
+            // gh 2.40+ 在多账号场景下 logout 会进入交互选择，需要用 --user 指定
+            // 这里用循环直到该 host 所有账号都登出（最多重试 5 次防止死循环）
+            if out.status.success() {
+                // 该 host 可能还有其他账号，再查一次
+                for _ in 0..5 {
+                    let still = Command::new("gh")
+                        .args(["auth", "status"])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output();
+                    match still {
+                        Ok(o) => {
+                            let stdout_str = String::from_utf8_lossy(&o.stdout).to_string();
+                            let stderr_str = String::from_utf8_lossy(&o.stderr).to_string();
+                            let combined = format!("{stdout_str}{stderr_str}");
+                            if !combined.to_lowercase().contains(host.as_str()) {
+                                break;
+                            }
+                            // 还有账号，继续 logout
+                            let _ = Command::new("gh")
+                                .args(["auth", "logout", "--hostname", host])
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .creation_flags(CREATE_NO_WINDOW)
+                                .output();
+                        }
+                        Err(_) => break,
+                    }
+                }
+            } else if combined.to_lowercase().contains("not logged") {
+                // 视为已登出
+            } else {
+                any_err = true;
+            }
+        }
+        if any_err {
+            Err(last_msg)
+        } else {
+            Ok(if last_msg.is_empty() {
+                "已登出所有账号".to_string()
+            } else {
+                last_msg
+            })
         }
     })
     .await
@@ -1788,22 +1969,73 @@ async fn gh_logout() -> Result<String, String> {
     result
 }
 
+/// 全局保存 gh auth login PowerShell 子进程句柄，用于取消登录时终止
+static GH_LOGIN_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
 /// 启动新 PowerShell 窗口运行 gh auth login（交互式登录必须在真实终端中完成）
+/// 返回子进程 PID，前端可用于追踪
 #[command]
-async fn gh_login_interactive() -> Result<(), String> {
+async fn gh_login_interactive() -> Result<u32, String> {
     tauri::async_runtime::spawn_blocking(|| {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
         // 启动新 PowerShell 窗口运行 gh auth login
-        // 限制窗口大小为 100x30，避免默认窗口过大
-        // 先 gh auth logout 清除旧 token，避免旧登录状态干扰 gh_wait_login 轮询
-        let script = "mode con: cols=100 lines=30; $Host.UI.RawUI.WindowTitle = 'GitHub CLI 登录'; Write-Host '===== GitHub CLI 登录 =====' -ForegroundColor Cyan; Write-Host '正在清除旧的登录状态...' -ForegroundColor Yellow; gh auth logout --hostname github.com 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host '（无旧登录或清除失败，可忽略）' -ForegroundColor DarkGray }; Write-Host ''; Write-Host '请在下方交互式完成 GitHub 授权流程' -ForegroundColor Yellow; Write-Host ''; gh auth login; Write-Host ''; Write-Host '登录流程结束，请关闭此窗口返回 ToolsPlus' -ForegroundColor Green; Read-Host '按回车键关闭'";
-        let _child = Command::new("powershell")
-            .args(["-NoExit", "-NoProfile", "-Command", script])
+        // 优化启动速度：直接用 mode con: 设置 cols/lines，标题用于后续查找
+        // 不再用 Add-Type + GetConsoleWindow（编译 Add-Type 慢）
+        // 登录完成（成功/失败）后延时自动关闭，无需用户按回车
+        // 先循环 gh auth logout 清除所有旧 token，避免旧登录状态干扰 gh_wait_login 轮询
+        let script = "$Host.UI.RawUI.WindowTitle = 'GitHub CLI 登录'; mode con: cols=100 lines=30; Write-Host '===== GitHub CLI 登录 =====' -ForegroundColor Cyan; Write-Host '正在清除所有旧的登录状态...' -ForegroundColor Yellow; for ($i=0; $i -lt 10; $i++) { $null = gh auth logout --hostname github.com 2>&1; if ($LASTEXITCODE -ne 0) { break } }; Write-Host '（旧登录已清除或无登录）' -ForegroundColor DarkGray; Write-Host ''; Write-Host '请在下方交互式完成 GitHub 授权流程' -ForegroundColor Yellow; Write-Host ''; gh auth login; if ($LASTEXITCODE -eq 0) { Write-Host ''; Write-Host '登录成功，正在切换账号...' -ForegroundColor Green; for ($i=0; $i -lt 5; $i++) { $null = gh auth switch --hostname github.com 2>&1; if ($LASTEXITCODE -eq 0) { break } }; Write-Host '登录成功，3 秒后窗口将自动关闭...' -ForegroundColor Green; Start-Sleep -Seconds 3 } else { Write-Host ''; Write-Host '登录失败或已取消，10 秒后窗口将自动关闭...' -ForegroundColor Red; Start-Sleep -Seconds 10 }";
+        let child = Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
             .creation_flags(0)
             .spawn()
             .map_err(|e| format!("启动登录窗口失败: {e}"))?;
-        Ok::<(), String>(())
+        let pid = child.id();
+        // 保存到全局，便于 cancel 时终止
+        if let Ok(mut guard) = GH_LOGIN_CHILD.lock() {
+            *guard = Some(child);
+        }
+        Ok::<u32, String>(pid)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 取消正在进行的 gh auth login：杀掉 PowerShell 子进程及其子进程树
+#[command]
+async fn gh_cancel_login() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut killed_any = false;
+        if let Ok(mut guard) = GH_LOGIN_CHILD.lock() {
+            if let Some(mut child) = guard.take() {
+                let pid = child.id();
+                // 用 taskkill /T /F 杀整棵进程树（PowerShell + gh 子进程）
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+                // 也尝试 kill Child
+                let _ = child.kill();
+                killed_any = true;
+            }
+        }
+        // 兜底：通过窗口标题查找并关闭（万一 PID 没保存成功）
+        let _ = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like '*GitHub CLI*' } | Stop-Process -Force -ErrorAction SilentlyContinue",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        if killed_any {
+            Ok(())
+        } else {
+            Ok(()) // 即使没杀到也不报错，前端只要关闭对话框即可
+        }
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2310,14 +2542,17 @@ pub fn run() {
             git_commit,
             git_branches,
             git_push,
+            git_revert,
             git_fetch,
             git_pull,
             git_clone,
+            git_init,
             pick_folder,
             gh_auth_state,
             gh_login_web,
             gh_logout,
             gh_login_interactive,
+            gh_cancel_login,
             gh_wait_login,
             gh_setup_git,
             install_git_and_gh,

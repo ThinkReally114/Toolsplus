@@ -20,6 +20,8 @@ interface ProcessInfo {
   status: string;
   icon: string | null;
   is_self: boolean;
+  is_related: boolean;
+  is_system: boolean;
 }
 
 interface ProcessIconEntry {
@@ -193,7 +195,12 @@ onMounted(refresh);
         v-for="p in filteredProcesses"
         :key="p.pid"
         class="proc-row"
-        :class="{ selected: selectedPid === p.pid, 'is-self': p.is_self }"
+        :class="{
+          selected: selectedPid === p.pid,
+          'is-self': p.is_self,
+          'is-related': p.is_related,
+          'is-system': p.is_system,
+        }"
         @click="selectRow(p.pid)"
       >
         <img
@@ -206,6 +213,8 @@ onMounted(refresh);
         <span class="proc-name-cell">
           <WinTextBlock :Text="p.name" Style="font-size:13px" />
           <span v-if="p.is_self" class="proc-self-badge">{{ i18n.t("process.selfBadge") }}</span>
+          <span v-else-if="p.is_related" class="proc-related-badge">{{ i18n.t("process.relatedBadge") }}</span>
+          <span v-else-if="p.is_system" class="proc-system-badge">{{ i18n.t("process.systemBadge") }}</span>
         </span>
         <WinTextBlock :Text="String(p.pid)" Style="font-size:13px;opacity:.8" Foreground="secondary" />
         <WinTextBlock :Text="`${p.cpu_usage.toFixed(1)}%`" Style="font-size:13px;text-align:right" />
@@ -373,6 +382,56 @@ html.theme-dark .proc-row.is-self {
 html.theme-dark .proc-self-badge {
   color: #003a6b;
   background: #4cc2ff;
+}
+
+.proc-row.is-related {
+  background: color-mix(in srgb, #107c10 6%, transparent);
+  box-shadow: inset 3px 0 0 #107c10;
+}
+
+html.theme-dark .proc-row.is-related {
+  background: color-mix(in srgb, #6fbb6f 8%, transparent);
+  box-shadow: inset 3px 0 0 #6fbb6f;
+}
+
+.proc-related-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 16px;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: #fff;
+  background: #107c10;
+}
+
+html.theme-dark .proc-related-badge {
+  color: #0a2e0a;
+  background: #6fbb6f;
+}
+
+.proc-row.is-system {
+  background: color-mix(in srgb, #c19c00 6%, transparent);
+  box-shadow: inset 3px 0 0 #c19c00;
+}
+
+html.theme-dark .proc-row.is-system {
+  background: color-mix(in srgb, #ffd355 8%, transparent);
+  box-shadow: inset 3px 0 0 #ffd355;
+}
+
+.proc-system-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 16px;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: #fff;
+  background: #c19c00;
+}
+
+html.theme-dark .proc-system-badge {
+  color: #3a2c00;
+  background: #ffd355;
 }
 
 .kill-dialog-body {
