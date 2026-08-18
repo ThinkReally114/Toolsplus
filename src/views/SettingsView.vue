@@ -13,8 +13,11 @@ import { navigationTransitionInfoEquals } from "@winui/utils/navigationTransitio
 import { useTheme, type ThemeMode } from "@/composables/useTheme";
 import {
   applyBackdrop,
+  applyBodyOpacity,
   getBackdrop,
   getOpacity,
+  getKeepBlur,
+  setKeepBlur,
   type BackdropType,
 } from "@/composables/useBackdrop";
 import {
@@ -119,6 +122,14 @@ const backdropOptions = computed(() => [
 
 const backdropValue = ref(getBackdrop());
 const opacityValue = ref(getOpacity());
+const keepBlur = ref(getKeepBlur());
+function onKeepBlurChange(v: boolean) {
+  keepBlur.value = v;
+  setKeepBlur(v);
+  if (!v) {
+    applyBodyOpacity(getOpacity());
+  }
+}
 
 function onBackdropChange(e: { AddedItems?: any[] }) {
   const item = e?.AddedItems?.[0];
@@ -277,6 +288,18 @@ function openRepo() {
                   :Text="opacityValue + '%'"
                   Style="font-size:12px;min-width:36px;text-align:right"
                   Foreground="secondary"
+                />
+              </div>
+              <div class="opacity-row" style="margin-top:8px">
+                <WinTextBlock
+                  :Text="i18n.t('settings.backdrop.keepBlur')"
+                  Style="font-size:13px"
+                />
+                <input
+                  type="checkbox"
+                  :checked="keepBlur"
+                  @change="onKeepBlurChange(($event.target as HTMLInputElement).checked)"
+                  style="width:16px;height:16px;cursor:pointer"
                 />
               </div>
             </div>

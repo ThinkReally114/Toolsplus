@@ -2058,9 +2058,7 @@ async fn gh_auth_state() -> GhAuthState {
             host: String::new(),
         };
     }
-    // 直接用 gh api user --jq .login 作为权威判断
-    // 成功=已登录+用户名，失败=未登录（避免解析 gh auth status 的 ✓ 前缀格式问题）
-    let api_result = tauri::async_runtime::spawn_blocking(|| {
+    let (has_token, user) = tauri::async_runtime::spawn_blocking(|| {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         use std::sync::mpsc;
@@ -2068,37 +2066,42 @@ async fn gh_auth_state() -> GhAuthState {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let out = Command::new("gh")
+            let token_out = Command::new("gh")
+                .args(["auth", "token"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            let user_out = Command::new("gh")
                 .args(["api", "user", "--jq", ".login"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
-            let _ = tx.send(out);
+            let _ = tx.send((token_out, user_out));
         });
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(o)) if o.status.success() => {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok((Ok(tok), Ok(usr))) => {
+                let has_tok = tok.status.success()
+                    && !String::from_utf8_lossy(&tok.stdout).trim().is_empty();
+                let username = if usr.status.success() {
+                    String::from_utf8_lossy(&usr.stdout).trim().to_string()
+                } else {
+                    String::new()
+                };
+                (has_tok, username)
             }
-            _ => None,
+            _ => (false, String::new()),
         }
     })
     .await
-    .unwrap_or(None);
+    .unwrap_or((false, String::new()));
 
-    if let Some(user) = api_result {
-        return GhAuthState {
-            gh_installed: true,
-            logged_in: true,
-            user,
-            host: "github.com".to_string(),
-        };
-    }
     GhAuthState {
         gh_installed: true,
-        logged_in: false,
-        user: String::new(),
-        host: String::new(),
+        logged_in: has_token,
+        user,
+        host: if has_token { "github.com".to_string() } else { String::new() },
     }
 }
 
@@ -2892,6 +2895,34 @@ fn set_window_backdrop(app: tauri::AppHandle, backdrop: u32) -> Result<(), Strin
     Ok(())
 }
 
+#[command]
+fn refresh_window_backdrop(app: tauri::AppHandle, backdrop: u32) -> Result<(), String> {
+    use tauri::Manager;
+    use windows::Win32::Graphics::Dwm::DwmFlush;
+    use windows::Win32::Graphics::Gdi::InvalidateRect;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER,
+    };
+    let _ = backdrop;
+    let window = app.get_webview_window("main").ok_or("未找到主窗口")?;
+    let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        let _ = InvalidateRect(Some(hwnd), None, true);
+        let _ = DwmFlush();
+    }
+    Ok(())
+}
+
 fn set_win32_accent(hwnd: windows::Win32::Foundation::HWND, accent_state: u32) -> Result<(), String> {
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -2972,7 +3003,8 @@ pub fn run() {
             relaunch_as_admin,
             optimize_states,
             optimize_set,
-            set_window_backdrop
+            set_window_backdrop,
+            refresh_window_backdrop
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

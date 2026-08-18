@@ -408,14 +408,20 @@ body .tree-icon {
 }
 
 html,
-body,
-#app {
+body {
   height: 100dvh !important;
   margin: 0;
   font-family: var(--app-font-family, "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif);
   -webkit-font-smoothing: var(--app-font-smoothing, auto);
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+  transition: background-color 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+#app {
+  height: 100dvh !important;
+  margin: 0;
+  transition: background-color 0.4s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .app-root {
@@ -428,7 +434,7 @@ body,
 .app-shell {
   flex: 1;
   min-height: 0;
-  zoom: var(--app-zoom, 1);
+  transform-origin: top left;
 }
 
 .app-shell.nav-right {

@@ -12,6 +12,7 @@ export type AntialiasMode = "auto" | "antialiased" | "subpixel-antialiased" | "n
 
 const FONT_KEY = "toolsplus-font";
 const AA_KEY = "toolsplus-antialias";
+const STYLE_ID = "toolsplus-font-style";
 
 const fontStackMap: Record<FontFamily, string> = {
   system: "system-ui, 'Segoe UI', 'Microsoft YaHei UI', sans-serif",
@@ -44,27 +45,86 @@ function loadAA(): AntialiasMode {
 export const fontFamily = ref<FontFamily>(loadFont());
 export const antialias = ref<AntialiasMode>(loadAA());
 
-export function applyFontFamily(f: FontFamily) {
-  const stack = fontStackMap[f] || fontStackMap.system;
-  document.documentElement.style.setProperty("--app-font-family", stack);
-  document.documentElement.style.fontFamily = stack;
-  document.body.style.fontFamily = stack;
-  const app = document.getElementById("app");
-  if (app) (app.style as any).fontFamily = stack;
-  document.querySelectorAll<HTMLElement>(".win-expander, .win-settings-card").forEach((el) => {
-    el.style.fontFamily = stack;
-  });
+function ensureStyleEl(): HTMLStyleElement {
+  let el = document.getElementById(STYLE_ID) as HTMLStyleElement | null;
+  if (!el) {
+    el = document.createElement("style");
+    el.id = STYLE_ID;
+    document.head.appendChild(el);
+  }
+  return el;
 }
 
-export function applyAntialias(m: AntialiasMode) {
+const ICON_FONT_STACK =
+  "'Segoe Fluent Icons', 'Segoe MDL2 Assets', 'WinUIOnWebIcons', 'Segoe UI Symbol'";
+
+function applyFontFamily(f: FontFamily) {
+  const stack = fontStackMap[f] || fontStackMap.system;
+  const html = document.documentElement;
+  const body = document.body;
+  html.style.setProperty("--app-font-family", stack);
+  html.style.setProperty("--ContentControlThemeFontFamily", stack);
+  if (body) {
+    body.style.setProperty("--app-font-family", stack);
+    body.style.setProperty("--ContentControlThemeFontFamily", stack);
+  }
+  const css = `
+html, body, #app, .app-root, .app-shell,
+.win-text-block, .win-text, .win-button, .win-button-content,
+.win-nav-item-content, .win-settings-card, .win-expander-content,
+.win-combo-box, .win-text-box, .win-radio-button, .win-check-box,
+.win-content-dialog-title, .win-content-dialog-body,
+.win-menu-flyout-item-text, .win-list-view-item-content,
+.win-breadcrumb-bar-item, .win-pivot-header, .win-info-bar-content,
+.win-grid-view-item-content, .win-hyperlink-button {
+  font-family: ${stack} !important;
+}
+.win-expander-header-icon, .win-settings-card-icon,
+.win-expander-header-icon *, .win-settings-card-icon *,
+.symbol-icon, .appbar-button-chevron,
+.win-symbol-icon, .win-font-icon, .win-icon,
+.win-pivot-header-icon, .win-info-bar-icon,
+.win-menu-flyout-icon, .win-list-view-item-icon,
+.win-breadcrumb-bar-icon, .win-command-bar-icon {
+  font-family: ${ICON_FONT_STACK} !important;
+}
+`;
+  ensureStyleEl().textContent = css;
+}
+
+function applyAntialias(m: AntialiasMode) {
   const html = document.documentElement;
   const body = document.body;
   const val = aaValueMap[m] || "auto";
-  html.style.setProperty("-webkit-font-smoothing", val);
-  body.style.setProperty("-webkit-font-smoothing", val);
   const renderMode = m === "none" ? "optimizeSpeed" : "optimizeLegibility";
+  html.style.setProperty("-webkit-font-smoothing", val);
+  html.style.setProperty("--app-font-smoothing", val);
   html.style.textRendering = renderMode;
-  body.style.textRendering = renderMode;
+  if (body) {
+    body.style.setProperty("-webkit-font-smoothing", val);
+    body.style.setProperty("--app-font-smoothing", val);
+    body.style.textRendering = renderMode;
+  }
+  const css = `
+html, body, #app, .app-root, .app-shell,
+.win-text-block, .win-text, .win-button, .win-button-content,
+.win-nav-item-content, .win-settings-card, .win-expander-content,
+.win-combo-box, .win-text-box, .win-radio-button, .win-check-box,
+.win-content-dialog-title, .win-content-dialog-body,
+.win-menu-flyout-item-text, .win-list-view-item-content,
+.win-breadcrumb-bar-item, .win-pivot-header, .win-info-bar-content,
+.win-grid-view-item-content, .win-hyperlink-button {
+  -webkit-font-smoothing: ${val} !important;
+  text-rendering: ${renderMode} !important;
+}
+`;
+  let el = document.getElementById(STYLE_ID + "-aa") as HTMLStyleElement | null;
+  if (!el) {
+    el = document.createElement("style");
+    el.id = STYLE_ID + "-aa";
+    document.head.appendChild(el);
+  }
+  el.textContent = css;
 }
 
 export function setFontFamily(f: FontFamily) {
