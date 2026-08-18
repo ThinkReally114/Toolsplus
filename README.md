@@ -89,4 +89,4 @@ src-tauri/target/release/
    └─ msi/ToolsPlus_0.1.0_x64_en-US.msi   # MSI 安装包
 ```
 
-> ⏱️ 首次编译约 5~12 分钟（需编译所有 Rust crate 依赖），增量编译会快很多。
+> ⏱️ 首次编译约 5~12 分钟（需编译所有 Rust crate 依赖），增量编译会快很多
