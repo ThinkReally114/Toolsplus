@@ -87,7 +87,7 @@ async function clean() {
   try {
     const targets = items.value
       .filter((i) => i.selected)
-      .map((i) => ({ key: i.key, path: i.path }));
+      .map((i) => ({ key: i.key, path: i.path, size: i.size }));
     if (targets.length === 0) return;
 
     if (hasTauri) {

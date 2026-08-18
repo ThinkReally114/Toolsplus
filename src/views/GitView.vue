@@ -86,6 +86,10 @@ const revertTarget = ref<GitCommit | null>(null);
 const revertBusy = ref(false);
 const revertError = ref("");
 const revertNoCommit = ref(false);
+const checkoutDialog = ref(false);
+const checkoutTarget = ref<GitCommit | null>(null);
+const checkoutBusy = ref(false);
+const checkoutError = ref("");
 const expandedCommit = ref<string | null>(null);
 
 function toggleCommitExpand(c: GitCommit) {
@@ -495,6 +499,37 @@ async function confirmRevert() {
     revertDialog.value = true;
   } finally {
     revertBusy.value = false;
+  }
+}
+
+function openCheckoutDialog(c: GitCommit) {
+  checkoutTarget.value = c;
+  checkoutError.value = "";
+  checkoutDialog.value = true;
+}
+
+async function confirmCheckout() {
+  if (!checkoutTarget.value) return;
+  checkoutBusy.value = true;
+  checkoutError.value = "";
+  try {
+    await invoke("git_checkout", {
+      repo: repoPath.value,
+      hash: checkoutTarget.value.hash,
+    });
+    await refreshAll();
+    await refreshBranches();
+    checkoutDialog.value = false;
+    showResult(
+      i18n.t("git.checkoutSuccessTitle"),
+      i18n.t("git.checkoutSuccess", { hash: checkoutTarget.value.short_hash })
+    );
+  } catch (e) {
+    checkoutError.value = String(e);
+    await nextTick();
+    checkoutDialog.value = true;
+  } finally {
+    checkoutBusy.value = false;
   }
 }
 
@@ -1151,6 +1186,12 @@ onMounted(async () => {
                   :IsEnabled="!busy"
                   Style="font-size:12px"
                 />
+                <WinButton
+                  :Content="i18n.t('git.checkout')"
+                  @click="openCheckoutDialog(c)"
+                  :IsEnabled="!busy"
+                  Style="font-size:12px"
+                />
               </div>
             </div>
           </div>
@@ -1211,6 +1252,32 @@ onMounted(async () => {
         <div v-if="revertBusy" class="git-revert-busy">
           <WinProgressRing :IsActive="true" :IsIndeterminate="true" :Width="20" :Height="20" />
           <WinTextBlock :Text="i18n.t('git.revertBusy')" Style="font-size:12px;opacity:.7" />
+        </div>
+      </div>
+    </WinContentDialog>
+
+    <WinContentDialog
+      v-model:IsOpen="checkoutDialog"
+      :Title="i18n.t('git.checkoutTitle')"
+      :Content="i18n.t('git.checkoutConfirmContent', { hash: checkoutTarget?.short_hash ?? '' })"
+      :PrimaryButtonText="i18n.t('git.checkoutConfirm')"
+      :CloseButtonText="i18n.t('git.checkoutCancel')"
+      :IsPrimaryButtonEnabled="!checkoutBusy"
+      DefaultButton="Close"
+      @PrimaryButtonClick="confirmCheckout"
+    >
+      <div class="git-revert-body">
+        <div class="git-revert-info">
+          <div><strong>{{ checkoutTarget?.short_hash }}</strong></div>
+          <div class="git-revert-msg">{{ checkoutTarget?.message }}</div>
+          <div class="git-revert-meta">{{ checkoutTarget?.author }} · {{ checkoutTarget?.date }}</div>
+        </div>
+        <div v-if="checkoutError" class="git-revert-error">
+          {{ checkoutError }}
+        </div>
+        <div v-if="checkoutBusy" class="git-revert-busy">
+          <WinProgressRing :IsActive="true" :IsIndeterminate="true" :Width="20" :Height="20" />
+          <WinTextBlock :Text="i18n.t('git.checkoutBusy')" Style="font-size:12px;opacity:.7" />
         </div>
       </div>
     </WinContentDialog>

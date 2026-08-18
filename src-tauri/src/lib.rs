@@ -17,26 +17,27 @@ struct JunkItem {
 struct CleanTarget {
     key: String,
     path: String,
+    size: u64,
 }
 
 /// 递归计算目录大小（字节数），遇到无权限或不存在返回 0
 fn dir_size(path: &Path) -> u64 {
     const MAX_DEPTH: u32 = 32;
     const MAX_ENTRIES: usize = 5_000_000;
-    let total = AtomicU64::new(0);
-    let visited = AtomicU64::new(0);
     if !path.exists() {
         return 0;
     }
+    let total = AtomicU64::new(0);
+    let visited = AtomicU64::new(0);
     let stack = vec![path.to_path_buf()];
     let mut current = stack;
     let mut depth_stack = vec![0u32];
+    let mut top_subdirs: Vec<std::path::PathBuf> = Vec::new();
     while let Some(dir) = current.pop() {
         let depth = depth_stack.pop().unwrap_or(0);
         if depth > MAX_DEPTH {
             continue;
         }
-        // 限制扫描条目数避免长时间卡死
         if visited.load(Ordering::Relaxed) > MAX_ENTRIES as u64 {
             break;
         }
@@ -52,8 +53,12 @@ fn dir_size(path: &Path) -> u64 {
                 Err(_) => continue,
             };
             if ft.is_dir() {
-                current.push(p);
-                depth_stack.push(depth + 1);
+                if depth == 0 {
+                    top_subdirs.push(p);
+                } else {
+                    current.push(p);
+                    depth_stack.push(depth + 1);
+                }
             } else if ft.is_file() {
                 if let Ok(meta) = entry.metadata() {
                     total.fetch_add(meta.len(), Ordering::Relaxed);
@@ -61,6 +66,58 @@ fn dir_size(path: &Path) -> u64 {
             }
         }
     }
+
+    if top_subdirs.is_empty() {
+        return total.load(Ordering::Relaxed);
+    }
+
+    std::thread::scope(|s| {
+        for subdir in &top_subdirs {
+            let total = &total;
+            let visited = &visited;
+            s.spawn(move || {
+                let local_total = AtomicU64::new(0);
+                let local_visited = AtomicU64::new(0);
+                let stack = vec![subdir.clone()];
+                let mut current = stack;
+                let mut depth_stack = vec![1u32];
+                while let Some(dir) = current.pop() {
+                    let depth = depth_stack.pop().unwrap_or(0);
+                    if depth > MAX_DEPTH {
+                        continue;
+                    }
+                    if visited.load(Ordering::Relaxed) + local_visited.load(Ordering::Relaxed)
+                        > MAX_ENTRIES as u64
+                    {
+                        break;
+                    }
+                    let entries = match fs::read_dir(&dir) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    for entry in entries.flatten() {
+                        local_visited.fetch_add(1, Ordering::Relaxed);
+                        let p = entry.path();
+                        let ft = match entry.file_type() {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
+                        if ft.is_dir() {
+                            current.push(p);
+                            depth_stack.push(depth + 1);
+                        } else if ft.is_file() {
+                            if let Ok(meta) = entry.metadata() {
+                                local_total.fetch_add(meta.len(), Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                total.fetch_add(local_total.load(Ordering::Relaxed), Ordering::Relaxed);
+                visited.fetch_add(local_visited.load(Ordering::Relaxed), Ordering::Relaxed);
+            });
+        }
+    });
+
     total.load(Ordering::Relaxed)
 }
 
@@ -106,54 +163,88 @@ async fn scan_junk() -> Vec<JunkItem> {
             ("logs", "%SYSTEMROOT%\\Logs"),
         ];
 
-        targets
+        let expanded: Vec<(String, String)> = targets
             .iter()
-            .map(|(key, raw)| {
-                let expanded = expand_path(raw);
-                let size = dir_size(Path::new(&expanded));
-                JunkItem {
-                    key: key.to_string(),
-                    path: expanded,
-                    size,
-                }
-            })
-            .collect()
+            .map(|(key, raw)| (key.to_string(), expand_path(raw)))
+            .collect();
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = expanded
+                .iter()
+                .map(|(key, path)| {
+                    let key = key.clone();
+                    let path = path.clone();
+                    s.spawn(move || {
+                        let size = dir_size(std::path::Path::new(&path));
+                        (key, path, size)
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .map(|(key, path, size)| JunkItem { key, path, size })
+                .collect()
+        })
     })
     .await
     .unwrap_or_default()
 }
 
-/// 递归删除目录下所有内容（保留目录本身）
-fn clean_dir_contents(path: &Path) -> u64 {
-    let freed = AtomicU64::new(0);
+/// 递归删除目录下所有内容（保留目录本身），返回是否无错误完成
+fn clean_dir_contents(path: &Path) -> bool {
     if !path.exists() {
-        return 0;
+        return false;
     }
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
-        Err(_) => return 0,
+        Err(_) => return false,
     };
+
+    let mut file_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut dir_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut all_ok = true;
+
     for entry in entries.flatten() {
         let p = entry.path();
         let ft = match entry.file_type() {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(_) => {
+                all_ok = false;
+                continue;
+            }
         };
-        let size = if ft.is_file() {
-            entry.metadata().map(|m| m.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        let res = if ft.is_dir() {
-            fs::remove_dir_all(&p)
-        } else {
-            fs::remove_file(&p)
-        };
-        if res.is_ok() {
-            freed.fetch_add(size, Ordering::Relaxed);
+        if ft.is_dir() {
+            dir_paths.push(p);
+        } else if ft.is_file() {
+            file_paths.push(p);
         }
     }
-    freed.load(Ordering::Relaxed)
+
+    for p in file_paths {
+        if fs::remove_file(&p).is_err() {
+            all_ok = false;
+        }
+    }
+
+    if !dir_paths.is_empty() {
+        let ok_flags = std::sync::Mutex::new(vec![false; dir_paths.len()]);
+        std::thread::scope(|s| {
+            for (i, p) in dir_paths.iter().enumerate() {
+                let ok_flags = &ok_flags;
+                s.spawn(move || {
+                    let ok = fs::remove_dir_all(p).is_ok();
+                    ok_flags.lock().unwrap()[i] = ok;
+                });
+            }
+        });
+        if ok_flags.lock().unwrap().iter().any(|&ok| !ok) {
+            all_ok = false;
+        }
+    }
+
+    all_ok
 }
 
 /// 清空回收站（调用系统 SHEmptyRecycleBinW，无需管理员权限）
@@ -176,19 +267,32 @@ fn empty_recycle_bin() -> bool {
 #[command]
 async fn clean_junk(targets: Vec<CleanTarget>) -> u64 {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut total = 0u64;
-        for t in targets {
-            let path = Path::new(&t.path);
-            if t.key == "recycle" {
-                let before = dir_size(path);
-                if empty_recycle_bin() {
-                    total += before;
-                }
-            } else {
-                total += clean_dir_contents(path);
-            }
-        }
-        total
+        std::thread::scope(|s| {
+            let handles: Vec<_> = targets
+                .into_iter()
+                .map(|t| {
+                    s.spawn(move || -> u64 {
+                        let path = Path::new(&t.path);
+                        if t.key == "recycle" {
+                            if empty_recycle_bin() {
+                                t.size
+                            } else {
+                                0
+                            }
+                        } else if clean_dir_contents(path) {
+                            t.size
+                        } else {
+                            0
+                        }
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .sum()
+        })
     })
     .await
     .unwrap_or(0)
@@ -769,6 +873,7 @@ struct ProcessInfo {
     is_self: bool,
     is_related: bool,
     is_system: bool,
+    parent_pid: Option<u32>,
 }
 
 /// exe 图标缓存：相同路径只提取一次
@@ -1113,6 +1218,7 @@ fn list_processes() -> Vec<ProcessInfo> {
                 is_self,
                 is_related,
                 is_system,
+                parent_pid: p.parent().map(|pp| pp.as_u32()),
             }
         })
         .collect();
@@ -1198,6 +1304,202 @@ fn kill_process(pid: u32) -> Result<String, String> {
     } else {
         Err(format!("未找到进程 {}", pid))
     }
+}
+
+/// 获取当前前台窗口对应的进程 PID
+#[tauri::command]
+fn get_foreground_window_pid() -> Result<u32, String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return Err("无法获取前台窗口".to_string());
+    }
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    if pid == 0 {
+        return Err("无法获取窗口进程 PID".to_string());
+    }
+    Ok(pid)
+}
+
+/// 冻结进程（NtSuspendProcess）
+#[tauri::command]
+fn suspend_process(pid: u32) -> Result<String, String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
+
+    type NtSuspendProcess = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE) -> i32;
+
+    let h = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, false, pid) }
+        .map_err(|e| format!("无法打开进程 {}：{}", pid, e))?;
+    let ntdll = unsafe { GetModuleHandleW(windows::core::w!("ntdll.dll")) }
+        .map_err(|e| format!("无法获取 ntdll 句柄：{}", e))?;
+    let addr = unsafe { GetProcAddress(ntdll, windows::core::s!("NtSuspendProcess")) }
+        .ok_or_else(|| "找不到 NtSuspendProcess".to_string())?;
+    let func: NtSuspendProcess = unsafe { std::mem::transmute(addr) };
+    let status = unsafe { func(h) };
+    unsafe { let _ = CloseHandle(h); };
+    if status < 0 {
+        return Err(format!("NtSuspendProcess 返回 0x{:X}", status as u32));
+    }
+    Ok(format!("进程 {} 已冻结", pid))
+}
+
+/// 恢复进程（NtResumeProcess）
+#[tauri::command]
+fn resume_process(pid: u32) -> Result<String, String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
+
+    type NtResumeProcess = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE) -> i32;
+
+    let h = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, false, pid) }
+        .map_err(|e| format!("无法打开进程 {}：{}", pid, e))?;
+    let ntdll = unsafe { GetModuleHandleW(windows::core::w!("ntdll.dll")) }
+        .map_err(|e| format!("无法获取 ntdll 句柄：{}", e))?;
+    let addr = unsafe { GetProcAddress(ntdll, windows::core::s!("NtResumeProcess")) }
+        .ok_or_else(|| "找不到 NtResumeProcess".to_string())?;
+    let func: NtResumeProcess = unsafe { std::mem::transmute(addr) };
+    let status = unsafe { func(h) };
+    unsafe { let _ = CloseHandle(h); };
+    if status < 0 {
+        return Err(format!("NtResumeProcess 返回 0x{:X}", status as u32));
+    }
+    Ok(format!("进程 {} 已恢复", pid))
+}
+
+/// 查询进程的 PPL 保护级别
+#[tauri::command]
+fn get_ppl_protection(pid: u32) -> Result<String, String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    type NtQueryInformationProcess = unsafe extern "system" fn(
+        HANDLE,
+        u32,
+        *mut std::ffi::c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
+
+    const PROCESS_PROTECTION_INFORMATION: u32 = 61;
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessProtection {
+        protection_level: u16,
+        _reserved1: u16,
+        _reserved2: u32,
+    }
+
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(|e| format!("无法打开进程 {}：{}", pid, e))?;
+    let ntdll = unsafe { GetModuleHandleW(windows::core::w!("ntdll.dll")) }
+        .map_err(|e| format!("无法获取 ntdll 句柄：{}", e))?;
+    let addr = unsafe { GetProcAddress(ntdll, windows::core::s!("NtQueryInformationProcess")) }
+        .ok_or_else(|| "找不到 NtQueryInformationProcess".to_string())?;
+    let func: NtQueryInformationProcess = unsafe { std::mem::transmute(addr) };
+
+    let mut info = ProcessProtection::default();
+    let mut ret_len: u32 = 0;
+    let status = unsafe {
+        func(
+            h,
+            PROCESS_PROTECTION_INFORMATION,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<ProcessProtection>() as u32,
+            &mut ret_len,
+        )
+    };
+    unsafe { let _ = CloseHandle(h); };
+
+    if status < 0 {
+        return Err(format!("NtQueryInformationProcess 返回 0x{:X}", status as u32));
+    }
+
+    let level = info.protection_level & 0x7;
+    let type_ = (info.protection_level >> 4) & 0x7;
+    let sign = (info.protection_level >> 8) & 0x7;
+
+    let type_str = match type_ {
+        0 => "None",
+        1 => "ProtectedLight",
+        2 => "Protected",
+        _ => "Unknown",
+    };
+    let level_str = match (type_, level) {
+        (0, _) => "无保护".to_string(),
+        (1, 0) => "ProtectedLight (None)".to_string(),
+        (1, 1) => "ProtectedLight (Lsa)".to_string(),
+        (1, 2) => "ProtectedLight (Windows)".to_string(),
+        (1, 3) => "ProtectedLight (AntiMalware)".to_string(),
+        (1, 4) => "ProtectedLight (CodeIntegrity)".to_string(),
+        (1, 5) => "ProtectedLight (Authenticode)".to_string(),
+        (2, 0) => "Protected (None)".to_string(),
+        (2, 1) => "Protected (Lsa)".to_string(),
+        (2, 2) => "Protected (Windows)".to_string(),
+        (2, 3) => "Protected (AntiMalware)".to_string(),
+        (2, 4) => "Protected (CodeIntegrity)".to_string(),
+        (2, 5) => "Protected (Authenticode)".to_string(),
+        _ => format!("Unknown ({}, {})", type_, level),
+    };
+    let sign_str = match sign {
+        0 => "None",
+        1 => "Authenticode",
+        2 => "CodeIntegrity",
+        3 => "Platform",
+        _ => "Unknown",
+    };
+
+    Ok(format!("Type: {} | Level: {} | Sign: {}", type_str, level_str, sign_str))
+}
+
+/// 以管理员权限重启进程（需要进程 exe 路径），成功后自动结束原进程
+#[tauri::command]
+fn restart_as_admin(pid: u32) -> Result<String, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+
+    let exe_path = {
+        let sys = SYS.lock().unwrap();
+        sys.process(sysinfo::Pid::from_u32(pid))
+            .and_then(|p| p.exe().map(|e| e.to_path_buf()))
+    }
+    .ok_or_else(|| format!("未找到进程 {} 或无法获取 exe 路径", pid))?;
+
+    let wide: Vec<u16> = exe_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_NORMAL,
+        )
+    };
+
+    if result.0 as usize <= 32 {
+        return Err(format!("ShellExecute 失败，返回码 {}", result.0 as usize));
+    }
+
+    let sys = SYS.lock().unwrap();
+    if let Some(process) = sys.process(sysinfo::Pid::from_u32(pid)) {
+        let _ = process.kill();
+    }
+    drop(sys);
+
+    Ok(format!("已以管理员权限重启进程 {} 并关闭原进程", pid))
 }
 
 // ==================== Git 可视化管理 ====================
@@ -1557,6 +1859,20 @@ fn git_revert(repo: String, hash: String, no_commit: Option<bool>) -> Result<Str
     }
     args.push(hash.trim());
     let (ok, out, err) = run_git(&repo, &args);
+    if ok {
+        Ok(out.trim().to_string())
+    } else {
+        Err(err.trim().to_string())
+    }
+}
+
+/// 切换工作区到指定提交（git checkout，进入 detached HEAD）
+#[command]
+fn git_checkout(repo: String, hash: String) -> Result<String, String> {
+    if hash.trim().is_empty() {
+        return Err("提交哈希不能为空".to_string());
+    }
+    let (ok, out, err) = run_git(&repo, &["checkout", hash.trim()]);
     if ok {
         Ok(out.trim().to_string())
     } else {
@@ -2523,6 +2839,7 @@ async fn optimize_set(key: String, enable: bool) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             scan_junk,
             clean_junk,
@@ -2531,6 +2848,11 @@ pub fn run() {
             list_processes,
             process_icons,
             kill_process,
+            get_foreground_window_pid,
+            suspend_process,
+            resume_process,
+            get_ppl_protection,
+            restart_as_admin,
             check_git,
             install_git,
             git_default_dir,
@@ -2543,6 +2865,7 @@ pub fn run() {
             git_branches,
             git_push,
             git_revert,
+            git_checkout,
             git_fetch,
             git_pull,
             git_clone,
