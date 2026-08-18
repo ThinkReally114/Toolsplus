@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { inject, computed } from "vue";
+import { inject, computed, ref } from "vue";
 import WinScrollViewer from "@winui/components/WinScrollViewer.vue";
 import WinExpander from "@winui/components/WinExpander.vue";
 import WinRadioButton from "@winui/components/WinRadioButton.vue";
@@ -11,6 +11,21 @@ import WinButton from "@winui/components/WinButton.vue";
 import { i18nKey, type I18n } from "@winui/components/i18n/index";
 import { navigationTransitionInfoEquals } from "@winui/utils/navigationTransitionInfo.js";
 import { useTheme, type ThemeMode } from "@/composables/useTheme";
+import {
+  applyBackdrop,
+  getBackdrop,
+  getOpacity,
+  type BackdropType,
+} from "@/composables/useBackdrop";
+import {
+  fontFamily as fontValue,
+  antialias as aaValue,
+  setFontFamily,
+  setAntialias,
+  type FontFamily,
+  type AntialiasMode,
+} from "@/composables/useFont";
+import { webviewZoom, applyZoom } from "@/composables/useZoom";
 import AppIcon from "@/components/AppIcon.vue";
 
 const i18n = inject<I18n>(i18nKey)!;
@@ -87,8 +102,68 @@ function onNavPosChange(e: { SelectedIndex?: number; AddedItems?: any[] }) {
 function reset() {
   localStorage.removeItem("toolsplus-theme");
   localStorage.removeItem("toolsplus-lang");
+  localStorage.removeItem("toolsplus-backdrop");
+  localStorage.removeItem("toolsplus-opacity");
+  localStorage.removeItem("toolsplus-font");
+  localStorage.removeItem("toolsplus-antialias");
+  localStorage.removeItem("toolsplus-webview-zoom");
   setTheme("system");
   location.reload();
+}
+
+const backdropOptions = computed(() => [
+  { label: i18n.t("settings.backdrop.none"), value: "none" },
+  { label: i18n.t("settings.backdrop.mica"), value: "mica" },
+  { label: i18n.t("settings.backdrop.acrylic"), value: "acrylic" },
+]);
+
+const backdropValue = ref(getBackdrop());
+const opacityValue = ref(getOpacity());
+
+function onBackdropChange(e: { AddedItems?: any[] }) {
+  const item = e?.AddedItems?.[0];
+  const tag = item?.value as BackdropType | undefined;
+  if (tag) {
+    backdropValue.value = tag;
+    applyBackdrop(tag, opacityValue.value);
+  }
+}
+
+function onOpacityChange(e: Event) {
+  const v = Number((e.target as HTMLInputElement).value);
+  opacityValue.value = v;
+  applyBackdrop(backdropValue.value, v);
+}
+
+const fontOptions = computed(() => [
+  { label: i18n.t("settings.font.system"), value: "system" },
+  { label: "Segoe UI", value: "segoe" },
+  { label: i18n.t("settings.font.yahei"), value: "yahei" },
+  { label: i18n.t("settings.font.simsun"), value: "simsun" },
+  { label: i18n.t("settings.font.kaiti"), value: "kaiti" },
+  { label: i18n.t("settings.font.consolas"), value: "consolas" },
+]);
+const fontSel = computed({
+  get: () => fontValue.value,
+  set: (v: FontFamily) => setFontFamily(v),
+});
+
+const aaOptions = computed(() => [
+  { label: i18n.t("settings.aa.auto"), value: "auto" },
+  { label: i18n.t("settings.aa.antialiased"), value: "antialiased" },
+  { label: i18n.t("settings.aa.subpixel"), value: "subpixel-antialiased" },
+  { label: i18n.t("settings.aa.none"), value: "none" },
+]);
+const aaSel = computed({
+  get: () => aaValue.value,
+  set: (v: AntialiasMode) => setAntialias(v),
+});
+
+const zoomValue = ref(webviewZoom.value);
+function onZoomChange(e: Event) {
+  const v = Number((e.target as HTMLInputElement).value);
+  zoomValue.value = v;
+  applyZoom(v);
 }
 
 function openRepo() {
@@ -169,6 +244,100 @@ function openRepo() {
                 :Content="i18n.t(opt.LabelKey)"
               />
             </WinRadioButtons>
+          </WinExpander>
+
+          <WinExpander
+            Height="80"
+            :Header="i18n.t('settings.backdrop.title')"
+            :Description="i18n.t('settings.backdrop.desc')"
+            HeaderIcon="&#xE7B3;"
+          >
+            <div class="backdrop-controls">
+              <WinComboBox
+                :SelectedValue="backdropValue"
+                :ItemsSource="backdropOptions"
+                DisplayMemberPath="label"
+                SelectedValuePath="value"
+                @SelectionChanged="onBackdropChange"
+              />
+              <div class="opacity-row">
+                <WinTextBlock
+                  :Text="i18n.t('settings.backdrop.opacity')"
+                  Style="font-size:13px"
+                />
+                <input
+                  type="range"
+                  min="20"
+                  max="100"
+                  :value="opacityValue"
+                  class="opacity-slider"
+                  @input="onOpacityChange"
+                />
+                <WinTextBlock
+                  :Text="opacityValue + '%'"
+                  Style="font-size:12px;min-width:36px;text-align:right"
+                  Foreground="secondary"
+                />
+              </div>
+            </div>
+          </WinExpander>
+
+          <WinExpander
+            Height="80"
+            :Header="i18n.t('settings.font.title')"
+            :Description="i18n.t('settings.font.desc')"
+            HeaderIcon="&#xE8D2;"
+          >
+            <div class="backdrop-controls">
+              <WinComboBox
+                v-model:SelectedValue="fontSel"
+                :ItemsSource="fontOptions"
+                DisplayMemberPath="label"
+                SelectedValuePath="value"
+              />
+              <div class="opacity-row">
+                <WinTextBlock
+                  :Text="i18n.t('settings.aa.title')"
+                  Style="font-size:13px"
+                />
+                <WinComboBox
+                  v-model:SelectedValue="aaSel"
+                  :ItemsSource="aaOptions"
+                  DisplayMemberPath="label"
+                  SelectedValuePath="value"
+                />
+              </div>
+            </div>
+          </WinExpander>
+
+          <WinExpander
+            Height="80"
+            :Header="i18n.t('settings.zoom.title')"
+            :Description="i18n.t('settings.zoom.desc')"
+            HeaderIcon="&#xE7E9;"
+          >
+            <div class="backdrop-controls">
+              <div class="opacity-row">
+                <WinTextBlock
+                  :Text="i18n.t('settings.zoom.scale')"
+                  Style="font-size:13px"
+                />
+                <input
+                  type="range"
+                  min="50"
+                  max="200"
+                  step="10"
+                  :value="zoomValue"
+                  class="opacity-slider"
+                  @input="onZoomChange"
+                />
+                <WinTextBlock
+                  :Text="zoomValue + '%'"
+                  Style="font-size:12px;min-width:40px;text-align:right"
+                  Foreground="secondary"
+                />
+              </div>
+            </div>
           </WinExpander>
         </div>
 
@@ -272,5 +441,46 @@ function openRepo() {
 
 .reset-btn {
   align-self: flex-start;
+}
+
+.backdrop-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.opacity-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.opacity-slider {
+  flex: 1;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--ControlStrongFillColorDefaultBrush, rgba(0, 0, 0, 0.2));
+  outline: none;
+  cursor: pointer;
+}
+
+html.theme-dark .opacity-slider {
+  background: var(--ControlStrongFillColorDefaultBrush, rgba(255, 255, 255, 0.3));
+}
+
+.opacity-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--AccentButtonBackground, #005fb8);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+html.theme-dark .opacity-slider::-webkit-slider-thumb {
+  background: #4cc2ff;
+  border-color: #2b2b2b;
 }
 </style>

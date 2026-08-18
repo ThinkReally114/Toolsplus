@@ -1,4 +1,5 @@
 import { ref, watch } from "vue";
+import { applyBodyOpacity, getOpacity } from "./useBackdrop";
 
 export type ThemeMode = "light" | "dark" | "system";
 
@@ -22,6 +23,7 @@ function applyHtmlThemeClass(resolved: "light" | "dark") {
   html.classList.remove("theme-light", "theme-dark");
   html.classList.add(`theme-${resolved}`);
   html.setAttribute("data-theme", resolved);
+  applyBodyOpacity(getOpacity());
 }
 
 export function resolvedTheme(): "light" | "dark" {

@@ -26,6 +26,9 @@ import {
 } from "@winui/utils/navigationTransitionInfo.js";
 import { toolboxZhCN, toolboxEnUS } from "./i18n/resources";
 import { useTheme } from "./composables/useTheme";
+import { initBackdrop } from "./composables/useBackdrop";
+import { initFont } from "./composables/useFont";
+import { initZoom } from "./composables/useZoom";
 import AppIcon from "@/components/AppIcon.vue";
 import TitleBar from "@/components/TitleBar.vue";
 
@@ -102,13 +105,13 @@ const navigationTransitionInfo = ref(
 provide("navigationTransitionInfo", navigationTransitionInfo);
 
 const TRANSITION_DURATIONS: Record<string, { enter: number; leave: number }> = {
-  DefaultNavigationTransitionInfo: { enter: 450, leave: 150 },
-  EntranceNavigationTransitionInfo: { enter: 450, leave: 150 },
-  DrillInNavigationTransitionInfo: { enter: 800, leave: 120 },
+  DefaultNavigationTransitionInfo: { enter: 280, leave: 120 },
+  EntranceNavigationTransitionInfo: { enter: 280, leave: 120 },
+  DrillInNavigationTransitionInfo: { enter: 350, leave: 100 },
   SuppressNavigationTransitionInfo: { enter: 0, leave: 0 },
-  SlideNavigationTransitionInfo: { enter: 450, leave: 150 },
-  CommonNavigationTransitionInfo: { enter: 560, leave: 140 },
-  ContinuumNavigationTransitionInfo: { enter: 620, leave: 260 },
+  SlideNavigationTransitionInfo: { enter: 280, leave: 120 },
+  CommonNavigationTransitionInfo: { enter: 320, leave: 110 },
+  ContinuumNavigationTransitionInfo: { enter: 380, leave: 200 },
 };
 
 const transitionDuration = computed(() => {
@@ -269,6 +272,12 @@ const exitDialogOpen = ref(false);
 let exitConfirmed = false;
 
 onMounted(async () => {
+  requestAnimationFrame(() => {
+    initBackdrop();
+    initFont();
+    initZoom();
+  });
+  import("@/views/HomeView.vue").catch(() => {});
   if (typeof (window as any).__TAURI_INTERNALS__ === "undefined") return;
   try {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -401,10 +410,10 @@ body .tree-icon {
 html,
 body,
 #app {
-  height: 100%;
+  height: 100dvh !important;
   margin: 0;
-  font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased;
+  font-family: var(--app-font-family, "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif);
+  -webkit-font-smoothing: var(--app-font-smoothing, auto);
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
@@ -412,13 +421,14 @@ body,
 .app-root {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
 .app-shell {
   flex: 1;
   min-height: 0;
+  zoom: var(--app-zoom, 1);
 }
 
 .app-shell.nav-right {

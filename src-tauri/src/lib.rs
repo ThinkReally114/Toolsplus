@@ -937,8 +937,8 @@ fn icon_to_png_base64(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> 
 
     let hdc = unsafe { CreateCompatibleDC(None) };
     if hdc.is_invalid() {
-        unsafe { let _ = DeleteObject(icon_info.hbmColor); }
-        unsafe { let _ = DeleteObject(icon_info.hbmMask); }
+        unsafe { let _ = DeleteObject(icon_info.hbmColor.into()); }
+        unsafe { let _ = DeleteObject(icon_info.hbmMask.into()); }
         return None;
     }
 
@@ -969,8 +969,8 @@ fn icon_to_png_base64(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> 
     };
 
     unsafe { let _ = DeleteDC(hdc); }
-    unsafe { let _ = DeleteObject(icon_info.hbmColor); }
-    unsafe { let _ = DeleteObject(icon_info.hbmMask); }
+    unsafe { let _ = DeleteObject(icon_info.hbmColor.into()); }
+    unsafe { let _ = DeleteObject(icon_info.hbmMask.into()); }
 
     if rows == 0 {
         return None;
@@ -2835,6 +2835,93 @@ async fn optimize_set(key: String, enable: bool) -> Result<(), String> {
     task
 }
 
+#[repr(C)]
+#[allow(non_snake_case)]
+struct AccentPolicy {
+    AccentState: u32,
+    AccentFlags: u32,
+    GradientColor: u32,
+    AnimationId: u32,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct WindowCompositionAttribData {
+    Attrib: u32,
+    pvData: *mut std::ffi::c_void,
+    cbData: usize,
+}
+
+const WCA_ACCENT_POLICY: u32 = 19;
+const ACCENT_DISABLE: u32 = 0;
+const ACCENT_ENABLE_BLURBEHIND: u32 = 3;
+const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
+
+#[command]
+fn set_window_backdrop(app: tauri::AppHandle, backdrop: u32) -> Result<(), String> {
+    use tauri::Manager;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+    };
+
+    let window = app.get_webview_window("main").ok_or("未找到主窗口")?;
+    let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+
+    if backdrop != 1 {
+        let value = backdrop as i32;
+        let r = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &value as *const _ as *const _,
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
+        if r.is_ok() {
+            let _ = set_win32_accent(hwnd, 0);
+            return Ok(());
+        }
+    }
+
+    let accent_state = match backdrop {
+        2 => ACCENT_ENABLE_BLURBEHIND,
+        3 => ACCENT_ENABLE_ACRYLICBLURBEHIND,
+        _ => ACCENT_DISABLE,
+    };
+    set_win32_accent(hwnd, accent_state)?;
+    Ok(())
+}
+
+fn set_win32_accent(hwnd: windows::Win32::Foundation::HWND, accent_state: u32) -> Result<(), String> {
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    type SetWindowCompositionAttribute =
+        unsafe extern "system" fn(windows::Win32::Foundation::HWND, *const WindowCompositionAttribData) -> i32;
+
+    let user32 = unsafe { GetModuleHandleW(windows::core::w!("user32.dll")) }
+        .map_err(|e| format!("无法获取 user32: {e}"))?;
+    let addr = unsafe { GetProcAddress(user32, windows::core::s!("SetWindowCompositionAttribute")) }
+        .ok_or_else(|| "找不到 SetWindowCompositionAttribute".to_string())?;
+    let func: SetWindowCompositionAttribute = unsafe { std::mem::transmute(addr) };
+
+    let policy = AccentPolicy {
+        AccentState: accent_state,
+        AccentFlags: 0,
+        GradientColor: 0x99000000,
+        AnimationId: 0,
+    };
+    let data = WindowCompositionAttribData {
+        Attrib: WCA_ACCENT_POLICY,
+        pvData: &policy as *const _ as *mut _,
+        cbData: std::mem::size_of::<AccentPolicy>(),
+    };
+    let ok = unsafe { func(hwnd, &data) };
+    if ok == 0 {
+        return Err("SetWindowCompositionAttribute 返回 0".to_string());
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2884,7 +2971,8 @@ pub fn run() {
             is_admin,
             relaunch_as_admin,
             optimize_states,
-            optimize_set
+            optimize_set,
+            set_window_backdrop
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

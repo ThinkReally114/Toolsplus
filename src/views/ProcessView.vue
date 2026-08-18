@@ -808,6 +808,19 @@ html.theme-dark .ppl-error {
   background: var(--SolidBackgroundFillColorBaseBrush, #fff);
   border: 1px solid var(--CardStrokeColorDefaultBrush, rgba(0, 0, 0, 0.12));
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  transform-origin: top left;
+  animation: ctxMenuIn 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes ctxMenuIn {
+  from {
+    opacity: 0;
+    transform: scale(0.9) translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
 }
 
 html.theme-dark .ctx-menu {
