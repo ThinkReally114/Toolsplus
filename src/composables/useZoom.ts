@@ -22,10 +22,10 @@ export function applyZoom(zoom: number) {
   document.documentElement.style.setProperty("--app-zoom", String(factor));
   const appShell = document.querySelector<HTMLElement>(".app-shell");
   if (appShell) {
-    appShell.style.transformOrigin = "top left";
-    appShell.style.transform = `scale(${factor})`;
-    appShell.style.width = `${100 / factor}%`;
-    appShell.style.height = `${100 / factor}%`;
+    appShell.style.zoom = String(factor);
+    appShell.style.transform = "";
+    appShell.style.width = "";
+    appShell.style.height = "";
   }
 }
 

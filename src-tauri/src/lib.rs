@@ -1,7 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tauri::command;
 
 /// 扫描结果项
@@ -1293,8 +1293,12 @@ fn process_icons(pids: Vec<u32>) -> Vec<ProcessIcon> {
 
 /// 结束进程
 #[tauri::command]
-fn kill_process(pid: u32) -> Result<String, String> {
+fn kill_process(_app: tauri::AppHandle, pid: u32) -> Result<String, String> {
     let sys = SYS.lock().unwrap();
+    let my_pid = std::process::id();
+    if pid == my_pid {
+        return Err("禁止结束 ToolsPlus 自身进程".to_string());
+    }
     if let Some(process) = sys.process(sysinfo::Pid::from_u32(pid)) {
         if process.kill() {
             Ok(format!("进程 {} 已结束", pid))
@@ -2011,6 +2015,55 @@ async fn pick_folder() -> Result<Option<String>, String> {
     .await
     .map_err(|e| e.to_string())?;
     Ok(task)
+}
+
+/// 弹出系统图片选择对话框，返回选中文件路径
+#[command]
+async fn pick_image() -> Result<Option<String>, String> {
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .set_title("选择图片")
+            .add_filter(
+                "图片",
+                &["png", "jpg", "jpeg", "bmp", "webp", "gif", "tif", "tiff"],
+            )
+            .pick_file()
+            .map(|p| p.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(task)
+}
+
+/// 读取图片文件并返回 data URL（data:image/<mime>;base64,...）
+fn guess_mime(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "tif" | "tiff" => "image/tiff",
+        _ => "image/png",
+    }
+}
+
+#[command]
+async fn read_image_as_data_url(path: String) -> Result<String, String> {
+    let task = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        use base64::Engine;
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let ext = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png");
+        let mime = guess_mime(ext);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(format!("data:{};base64,{}", mime, b64))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    task
 }
 
 /// gh 登录状态
@@ -2864,7 +2917,8 @@ const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
 fn set_window_backdrop(app: tauri::AppHandle, backdrop: u32) -> Result<(), String> {
     use tauri::Manager;
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_ROUND,
     };
 
     let window = app.get_webview_window("main").ok_or("未找到主窗口")?;
@@ -2882,6 +2936,23 @@ fn set_window_backdrop(app: tauri::AppHandle, backdrop: u32) -> Result<(), Strin
         };
         if r.is_ok() {
             let _ = set_win32_accent(hwnd, 0);
+            let border_color: u32 = 0x00000000;
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    &border_color as *const _ as *const _,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            };
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &DWMWCP_ROUND as *const _ as *const _,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            };
             return Ok(());
         }
     }
@@ -2891,6 +2962,25 @@ fn set_window_backdrop(app: tauri::AppHandle, backdrop: u32) -> Result<(), Strin
         3 => ACCENT_ENABLE_ACRYLICBLURBEHIND,
         _ => ACCENT_DISABLE,
     };
+    if accent_state == ACCENT_DISABLE {
+        let border_default: u32 = 0xFFFFFFFF;
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &border_default as *const _ as *const _,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &DWMWCP_DEFAULT as *const _ as *const _,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+    }
     set_win32_accent(hwnd, accent_state)?;
     Ok(())
 }
@@ -2921,6 +3011,496 @@ fn refresh_window_backdrop(app: tauri::AppHandle, backdrop: u32) -> Result<(), S
         let _ = DwmFlush();
     }
     Ok(())
+}
+
+/// 桌面窗口信息
+#[derive(serde::Serialize)]
+struct WindowInfo {
+    hwnd: usize,
+    pid: u32,
+    title: String,
+    class_name: String,
+    exe_path: String,
+    exe_name: String,
+    is_visible: bool,
+    is_topmost: bool,
+    is_click_through: bool,
+    is_minimized: bool,
+    is_maximized: bool,
+    opacity: u8,
+    icon: Option<String>,
+}
+
+/// 从窗口提取 HICON 并转 PNG base64（自适应尺寸）
+fn extract_window_icon(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassLongPtrW, SendMessageW, GCLP_HICON, HICON, ICON_BIG, ICON_SMALL, WM_GETICON,
+    };
+    let mut hicon: HICON = HICON::default();
+    unsafe {
+        let r = SendMessageW(hwnd, WM_GETICON, Some(WPARAM(ICON_BIG as usize)), Some(LPARAM(0)));
+        if r.0 != 0 {
+            hicon = HICON(r.0 as *mut _);
+        } else {
+            let r2 = SendMessageW(hwnd, WM_GETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(0)));
+            if r2.0 != 0 {
+                hicon = HICON(r2.0 as *mut _);
+            } else {
+                let cls = GetClassLongPtrW(hwnd, GCLP_HICON);
+                if cls != 0 {
+                    hicon = HICON(cls as *mut _);
+                }
+            }
+        }
+    }
+    if hicon.is_invalid() {
+        return None;
+    }
+    icon_to_png_base64_auto(hicon)
+}
+
+/// 自适应尺寸的 HICON -> PNG base64
+fn icon_to_png_base64_auto(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<String> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, DeleteObject, DeleteDC, GetDIBits, GetObjectW,
+        BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_USAGE, RGBQUAD,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
+
+    let mut icon_info = ICONINFO::default();
+    unsafe { GetIconInfo(hicon, &mut icon_info).ok()? };
+
+    let mut bmp = BITMAP::default();
+    let has_size = unsafe {
+        GetObjectW(
+            icon_info.hbmColor.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bmp as *mut _ as *mut _),
+        ) != 0
+    };
+    let w = if has_size && bmp.bmWidth > 0 { bmp.bmWidth } else { 32 };
+    let h = if has_size && bmp.bmHeight > 0 { bmp.bmHeight } else { 32 };
+
+    let hdc = unsafe { CreateCompatibleDC(None) };
+    if hdc.is_invalid() {
+        unsafe { let _ = DeleteObject(icon_info.hbmColor.into()); }
+        unsafe { let _ = DeleteObject(icon_info.hbmMask.into()); }
+        return None;
+    }
+
+    let mut bi = BITMAPINFOHEADER::default();
+    bi.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.biWidth = w;
+    bi.biHeight = -h;
+    bi.biPlanes = 1;
+    bi.biBitCount = 32;
+    bi.biCompression = 0;
+
+    let mut bmi = BITMAPINFO {
+        bmiHeader: bi,
+        bmiColors: [RGBQUAD::default(); 1],
+    };
+
+    let mut pixels: Vec<u8> = vec![0u8; (w * h * 4) as usize];
+    let rows = unsafe {
+        GetDIBits(
+            hdc,
+            icon_info.hbmColor,
+            0,
+            h as u32,
+            Some(pixels.as_mut_ptr() as *mut _),
+            &mut bmi,
+            DIB_USAGE(0),
+        )
+    };
+
+    unsafe { let _ = DeleteDC(hdc); }
+    unsafe { let _ = DeleteObject(icon_info.hbmColor.into()); }
+    unsafe { let _ = DeleteObject(icon_info.hbmMask.into()); }
+
+    if rows == 0 {
+        return None;
+    }
+
+    let png = rgba_to_png(w as u32, h as u32, &pixels)?;
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    Some(format!("data:image/png;base64,{}", b64))
+}
+
+/// 从 HWND 获取所属进程 PID
+fn hwnd_to_pid(hwnd: windows::Win32::Foundation::HWND) -> u32 {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid
+}
+
+/// 从 PID 获取 exe 路径（QueryFullProcessImageNameW）
+fn pid_to_exe(pid: u32) -> (String, String) {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let exe_path: String = {
+        let handle = unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+        };
+        let Ok(handle) = handle else { return (String::new(), String::new()) };
+        let mut buf = [0u16; 1024];
+        let mut len: u32 = buf.len() as u32;
+        let ok = unsafe {
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+        };
+        let _ = unsafe { CloseHandle(handle) };
+        if ok.is_err() || len == 0 {
+            return (String::new(), String::new());
+        }
+        let os_str: std::ffi::OsString =
+            <std::ffi::OsString as OsStringExt>::from_wide(&buf[..len as usize]);
+        os_str.to_string_lossy().to_string()
+    };
+
+    let exe_name = std::path::Path::new(&exe_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    (exe_path, exe_name)
+}
+
+#[derive(serde::Serialize)]
+struct HoveredWindow {
+    hwnd: usize,
+    pid: u32,
+    title: String,
+    exe_name: String,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    is_self: bool,
+    smooth: bool,
+    ease: u32,
+}
+
+static HOVER_ENABLED: AtomicBool = AtomicBool::new(true);
+static HUD_SMOOTH: AtomicBool = AtomicBool::new(true);
+static HUD_EASE_MS: AtomicU32 = AtomicU32::new(180);
+
+#[tauri::command]
+fn set_hud_ease(ms: u32) {
+    let clamped = ms.clamp(60, 600);
+    HUD_EASE_MS.store(clamped, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn set_hover_overlay(enabled: bool) {
+    HOVER_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn set_hud_smooth(enabled: bool) {
+    HUD_SMOOTH.store(enabled, Ordering::Relaxed);
+}
+
+#[derive(serde::Serialize)]
+struct VisualState {
+    hover: bool,
+    smooth: bool,
+    ease: u32,
+}
+
+#[tauri::command]
+fn get_visual_state() -> VisualState {
+    VisualState {
+        hover: HOVER_ENABLED.load(Ordering::Relaxed),
+        smooth: HUD_SMOOTH.load(Ordering::Relaxed),
+        ease: HUD_EASE_MS.load(Ordering::Relaxed),
+    }
+}
+
+#[tauri::command]
+fn get_window_under_cursor() -> Option<HoveredWindow> {
+    if !HOVER_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetWindowRect, GetWindowTextW, WindowFromPoint,
+    };
+
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return None;
+    }
+    let hwnd = unsafe { WindowFromPoint(pt) };
+    if hwnd.0.is_null() {
+        return None;
+    }
+
+    let mut title_buf = [0u16; 512];
+    let title_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) };
+    let title = if title_len > 0 {
+        String::from_utf16_lossy(&title_buf[..title_len as usize])
+    } else {
+        String::new()
+    };
+
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rc) }.is_err() {
+        return None;
+    }
+
+    let pid = hwnd_to_pid(hwnd);
+    let (_exe_path, exe_name) = pid_to_exe(pid);
+    let is_self = pid == std::process::id();
+
+    Some(HoveredWindow {
+        hwnd: hwnd.0 as usize,
+        pid,
+        title,
+        exe_name,
+        x: rc.left,
+        y: rc.top,
+        width: rc.right - rc.left,
+        height: rc.bottom - rc.top,
+        is_self,
+        smooth: HUD_SMOOTH.load(Ordering::Relaxed),
+        ease: HUD_EASE_MS.load(Ordering::Relaxed),
+    })
+}
+
+/// 枚举所有桌面窗口
+#[tauri::command]
+fn list_windows() -> Vec<WindowInfo> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetLayeredWindowAttributes,
+        GetWindowTextW, GetWindowLongW, IsIconic, IsWindowVisible, IsZoomed,
+        GWL_EXSTYLE, LWA_ALPHA, WNDENUMPROC, WS_EX_LAYERED, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT,
+    };
+
+    let mut result: Vec<WindowInfo> = Vec::new();
+    let result_ptr = &mut result as *mut Vec<WindowInfo>;
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let result = &mut *(lparam.0 as *mut Vec<WindowInfo>);
+
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_visible = IsWindowVisible(hwnd).as_bool();
+        let is_layered = (ex_style & WS_EX_LAYERED.0) != 0;
+
+        let mut title_buf = [0u16; 512];
+        let title_len = GetWindowTextW(hwnd, &mut title_buf);
+        let title = if title_len > 0 {
+            String::from_utf16_lossy(&title_buf[..title_len as usize])
+        } else {
+            String::new()
+        };
+
+        let mut class_buf = [0u16; 256];
+        let class_len = GetClassNameW(hwnd, &mut class_buf);
+        let class_name = if class_len > 0 {
+            String::from_utf16_lossy(&class_buf[..class_len as usize])
+        } else {
+            String::new()
+        };
+
+        let pid = hwnd_to_pid(hwnd);
+        let (exe_path, exe_name) = pid_to_exe(pid);
+
+        let is_topmost = (ex_style & WS_EX_TOPMOST.0) != 0;
+        let is_click_through =
+            (ex_style & WS_EX_TRANSPARENT.0) != 0 && is_layered;
+        let is_minimized = IsIconic(hwnd).as_bool();
+        let is_maximized = IsZoomed(hwnd).as_bool();
+
+        let mut alpha: u8 = 255;
+        if is_layered {
+            let mut colorref = COLORREF(0);
+            let mut a: u8 = 0;
+            let mut flags = windows::Win32::UI::WindowsAndMessaging::LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+            let ok = GetLayeredWindowAttributes(
+                hwnd,
+                Some(&mut colorref),
+                Some(&mut a),
+                Some(&mut flags),
+            );
+            if ok.is_ok() && (flags.0 & LWA_ALPHA.0) != 0 {
+                alpha = a;
+            }
+        }
+
+        let icon = extract_window_icon(hwnd);
+
+        result.push(WindowInfo {
+            hwnd: hwnd.0 as usize,
+            pid,
+            title,
+            class_name,
+            exe_path,
+            exe_name,
+            is_visible,
+            is_topmost,
+            is_click_through,
+            is_minimized,
+            is_maximized,
+            opacity: alpha,
+            icon,
+        });
+        BOOL(1)
+    }
+
+    let func: WNDENUMPROC = Some(enum_proc);
+    unsafe {
+        let _ = EnumWindows(func, LPARAM(result_ptr as isize));
+    }
+
+    result.sort_by(|a, b| a.exe_name.to_lowercase().cmp(&b.exe_name.to_lowercase()));
+    result
+}
+
+#[tauri::command]
+fn window_close_task(app: tauri::AppHandle, hwnd: usize) -> Result<(), String> {
+    use tauri::Manager;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    let target_raw = hwnd as *mut _;
+    for w in app.webview_windows().values() {
+        if let Ok(h) = w.hwnd() {
+            if h.0 == target_raw {
+                return Err("禁止关闭 ToolsPlus 自身窗口".to_string());
+            }
+        }
+    }
+    let target = HWND(target_raw);
+    let r = unsafe { PostMessageW(Some(target), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    r.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_destroy(app: tauri::AppHandle, hwnd: usize) -> Result<(), String> {
+    use tauri::Manager;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+    let target_raw = hwnd as *mut _;
+    for w in app.webview_windows().values() {
+        if let Ok(h) = w.hwnd() {
+            if h.0 == target_raw {
+                return Err("禁止销毁 ToolsPlus 自身窗口".to_string());
+            }
+        }
+    }
+    let target = HWND(target_raw);
+    let r = unsafe { DestroyWindow(target) };
+    r.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_set_topmost(hwnd: usize, topmost: bool) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    let after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    let r = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(after),
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    };
+    r.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_set_click_through(hwnd: usize, enabled: bool) -> Result<(), String> {
+    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, SetLayeredWindowAttributes, GWL_EXSTYLE, LWA_ALPHA,
+        WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    let cur = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    let new = if enabled {
+        cur | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0
+    } else {
+        cur & !(WS_EX_TRANSPARENT.0)
+    };
+    unsafe { SetWindowLongW(hwnd, GWL_EXSTYLE, new as i32) };
+    if enabled {
+        let r = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 200, LWA_ALPHA) };
+        r.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn window_set_opacity(hwnd: usize, opacity: u8) -> Result<(), String> {
+    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, SetLayeredWindowAttributes, GWL_EXSTYLE, LWA_ALPHA,
+        WS_EX_LAYERED,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    let cur = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    if (cur & WS_EX_LAYERED.0) == 0 {
+        unsafe { SetWindowLongW(hwnd, GWL_EXSTYLE, (cur | WS_EX_LAYERED.0) as i32) };
+    }
+    let r = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), opacity, LWA_ALPHA) };
+    r.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_minimize(hwnd: usize) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MINIMIZE};
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe { let _ = ShowWindow(hwnd, SW_MINIMIZE); }
+    Ok(())
+}
+
+#[tauri::command]
+fn window_redraw(hwnd: usize) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::DwmFlush;
+    use windows::Win32::Graphics::Gdi::{
+        InvalidateRect, RedrawWindow, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, UpdateWindow,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+        let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+        let _ = UpdateWindow(hwnd);
+        let _ = DwmFlush();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn window_copy_path(hwnd: usize) -> Result<String, String> {
+    use windows::Win32::Foundation::HWND;
+    let hwnd = HWND(hwnd as *mut _);
+    let pid = hwnd_to_pid(hwnd);
+    if pid == 0 {
+        return Err("无法获取窗口进程 PID".into());
+    }
+    let (path, _name) = pid_to_exe(pid);
+    if path.is_empty() {
+        return Err("无法获取进程 exe 路径".into());
+    }
+    Ok(path)
 }
 
 fn set_win32_accent(hwnd: windows::Win32::Foundation::HWND, accent_state: u32) -> Result<(), String> {
@@ -2955,6 +3535,7 @@ fn set_win32_accent(hwnd: windows::Win32::Foundation::HWND, accent_state: u32) -
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    eprintln!("[toolsplus] run() entered at {:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -2967,6 +3548,11 @@ pub fn run() {
             process_icons,
             kill_process,
             get_foreground_window_pid,
+            get_window_under_cursor,
+            set_hover_overlay,
+            set_hud_smooth,
+            set_hud_ease,
+            get_visual_state,
             suspend_process,
             resume_process,
             get_ppl_protection,
@@ -2989,6 +3575,8 @@ pub fn run() {
             git_clone,
             git_init,
             pick_folder,
+            pick_image,
+            read_image_as_data_url,
             gh_auth_state,
             gh_login_web,
             gh_logout,
@@ -3004,7 +3592,16 @@ pub fn run() {
             optimize_states,
             optimize_set,
             set_window_backdrop,
-            refresh_window_backdrop
+            refresh_window_backdrop,
+            list_windows,
+            window_close_task,
+            window_destroy,
+            window_set_topmost,
+            window_set_click_through,
+            window_set_opacity,
+            window_minimize,
+            window_redraw,
+            window_copy_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

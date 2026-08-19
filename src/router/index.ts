@@ -29,6 +29,11 @@ const routes: RouteRecordRaw[] = [
     component: () => import("@/views/OptimizeView.vue"),
   },
   {
+    path: "/visual",
+    name: "visual",
+    component: () => import("@/views/VisualView.vue"),
+  },
+  {
     path: "/git",
     name: "git",
     component: () => import("@/views/GitView.vue"),

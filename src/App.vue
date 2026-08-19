@@ -56,6 +56,7 @@ const menuItems = computed(() => [
       { Tag: "performance", Icon: icon("performance"), Content: t("nav.performance") },
       { Tag: "process", Icon: icon("process"), Content: t("nav.process") },
       { Tag: "optimize", Icon: icon("optimize"), Content: t("nav.optimize") },
+      { Tag: "visual", Icon: icon("hud"), Content: t("nav.visual") },
     ],
   },
   {
@@ -434,7 +435,6 @@ body {
 .app-shell {
   flex: 1;
   min-height: 0;
-  transform-origin: top left;
 }
 
 .app-shell.nav-right {

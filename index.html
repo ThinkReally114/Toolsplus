@@ -31,6 +31,27 @@
         font-size: 13px;
         white-space: pre-wrap;
       }
+      #app-diag {
+        position: fixed;
+        bottom: 12px;
+        left: 12px;
+        z-index: 99999;
+        background: rgba(0, 0, 0, 0.85);
+        color: #0f0;
+        font-family: "Consolas", "Segoe UI", monospace;
+        font-size: 11px;
+        padding: 10px 14px;
+        border-radius: 6px;
+        max-width: 480px;
+        max-height: 200px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+        display: none;
+      }
+      #app-diag.visible {
+        display: block;
+      }
     </style>
     <script>
       (function () {
@@ -44,6 +65,48 @@
           document.documentElement.classList.add("theme-" + resolved);
           document.documentElement.setAttribute("data-theme", resolved);
         } catch (e) {}
+      })();
+
+      // 诊断面板：应用卡死时按 F12 显示
+      (function () {
+        var diagEl = null;
+        function ensureDiag() {
+          if (diagEl) return diagEl;
+          diagEl = document.createElement("div");
+          diagEl.id = "app-diag";
+          document.body.appendChild(diagEl);
+          return diagEl;
+        }
+        function dumpDiag() {
+          var el = ensureDiag();
+          var d = window.__TOOLSPLUS_DIAG__;
+          if (!d) {
+            el.textContent = "diag not yet initialized (main.ts not loaded?)";
+            el.classList.add("visible");
+            return;
+          }
+          el.textContent =
+            "=== ToolsPlus Diagnostic ===\n" +
+            "webview2: " + d.webview2Version + "\n" +
+            "tauriOk: " + d.tauriOk + "\n" +
+            "bootMs: " + Math.round(performance.now() - d.t0) + "ms\n" +
+            "--- log ---\n" +
+            d.errors.join("\n");
+          el.classList.add("visible");
+        }
+        window.addEventListener("keydown", function (e) {
+          if (e.key === "F12") {
+            e.preventDefault();
+            dumpDiag();
+          }
+        });
+        // 10 秒后如果 main.ts 还没加载，自动显示诊断
+        setTimeout(function () {
+          var app = document.getElementById("app");
+          if (app && app.textContent && app.textContent.indexOf("Loading") !== -1) {
+            dumpDiag();
+          }
+        }, 10000);
       })();
     </script>
   </head>

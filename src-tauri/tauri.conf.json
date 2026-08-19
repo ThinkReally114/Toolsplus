@@ -24,6 +24,20 @@
         "resizable": true,
         "center": true,
         "backgroundColor": "#00000000"
+      },
+      {
+        "label": "glass",
+        "title": "Glass",
+        "url": "index.html",
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "fullscreen": true,
+        "visible": false,
+        "focus": false,
+        "skipTaskbar": true,
+        "backgroundColor": "#00000000"
       }
     ]
   },

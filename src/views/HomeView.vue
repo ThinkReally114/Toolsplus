@@ -10,6 +10,11 @@ import WinCase from "@winui/components/WinCase.vue";
 import WinSwitchPresenter from "@winui/components/WinSwitchPresenter.vue";
 import AppIcon from "@/components/AppIcon.vue";
 import { i18nKey, type I18n } from "@winui/components/i18n/index";
+import {
+  initHomeBackground,
+  homeBackgroundUrl,
+  homeBackgroundOpacity,
+} from "@/composables/useHomeBackground";
 
 const i18n = inject<I18n>(i18nKey)!;
 const router = useRouter();
@@ -68,6 +73,20 @@ async function checkAdmin() {
 onMounted(() => {
   loadHardware();
   checkAdmin();
+  initHomeBackground();
+});
+
+const bgUrl = homeBackgroundUrl();
+const bgOpacity = homeBackgroundOpacity();
+const headerImageStyle = computed(() => {
+  if (!bgUrl.value) return {};
+  return {
+    backgroundImage: `url("${bgUrl.value}")`,
+    backgroundSize: "cover",
+    backgroundPosition: "center",
+    backgroundRepeat: "no-repeat",
+    opacity: String(bgOpacity.value / 100),
+  } as Record<string, string>;
 });
 
 const headerTiles = computed(() => [
@@ -218,7 +237,7 @@ function go(tag: string) {
         <section class="home-page-header">
           <div class="home-header-image-mask">
             <div class="home-header-image-grid">
-              <div class="home-header-image"></div>
+              <div class="home-header-image" :style="headerImageStyle"></div>
             </div>
           </div>
 

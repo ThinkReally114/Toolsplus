@@ -8,6 +8,25 @@ const i18n = inject<I18n>(i18nKey)!;
 
 const isMaximized = ref(false);
 const hasTauri = ref(false);
+const glassActive = ref(false);
+
+async function toggleGlass() {
+  if (!hasTauri.value) return;
+  try {
+    const { Window } = await import("@tauri-apps/api/window");
+    const glass = await Window.getByLabel("glass");
+    if (!glass) return;
+    if (await glass.isVisible()) {
+      await glass.hide();
+      glassActive.value = false;
+      return;
+    }
+    await glass.show();
+    glassActive.value = true;
+  } catch (e) {
+    console.error(e);
+  }
+}
 
 async function checkTauri() {
   try {
@@ -65,7 +84,15 @@ async function onToggleMaximize() {
 async function onClose() {
   if (!hasTauri.value) return;
   try {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const { getCurrentWindow, Window } = await import("@tauri-apps/api/window");
+    const glass = await Window.getByLabel("glass");
+    if (glass) {
+      try {
+        await glass.destroy();
+      } catch {
+        // ignore
+      }
+    }
     await getCurrentWindow().close();
   } catch (e) {
     console.error(e);
@@ -80,6 +107,15 @@ async function onClose() {
       <span class="titlebar-title" data-tauri-drag-region>{{ i18n.t("app.title") }}</span>
     </div>
     <div class="titlebar-controls">
+      <button
+        class="titlebar-btn"
+        :class="{ 'is-on': glassActive }"
+        :title="i18n.t('titlebar.glass')"
+        @click="toggleGlass"
+        :disabled="!hasTauri"
+      >
+        <AppIcon name="layers" :size="16" />
+      </button>
       <button class="titlebar-btn" :title="i18n.t('titlebar.minimize')" @click="onMinimize" :disabled="!hasTauri">
         <AppIcon name="minimize" :size="16" />
       </button>
@@ -170,5 +206,13 @@ html.theme-dark .titlebar-btn:hover:not(:disabled) {
 .titlebar-close:hover:not(:disabled) {
   background: #c42b1c;
   color: #fff;
+}
+
+.titlebar-btn.is-on {
+  color: var(--AccentButtonBackground, #005fb8);
+}
+
+html.theme-dark .titlebar-btn.is-on {
+  color: var(--AccentButtonBackground, #4cc2ff);
 }
 </style>

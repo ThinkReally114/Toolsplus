@@ -17,7 +17,7 @@ const REFRESH_INTERVAL_MS = 1500;
 
 export function getBackdrop(): BackdropType {
   const v = localStorage.getItem(BACKDROP_KEY);
-  if (v === "none" || v === "mica" || v === "acrylic") return v;
+  if (v === "none" || v === "mica") return v;
   return "none";
 }
 

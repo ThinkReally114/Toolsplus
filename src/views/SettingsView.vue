@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { inject, computed, ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import WinScrollViewer from "@winui/components/WinScrollViewer.vue";
 import WinExpander from "@winui/components/WinExpander.vue";
 import WinRadioButton from "@winui/components/WinRadioButton.vue";
@@ -29,6 +30,13 @@ import {
   type AntialiasMode,
 } from "@/composables/useFont";
 import { webviewZoom, applyZoom } from "@/composables/useZoom";
+import {
+  getHomeBackgroundPath,
+  clearHomeBackground,
+  setHomeBackground,
+  homeBackgroundOpacity,
+  setHomeBackgroundOpacity,
+} from "@/composables/useHomeBackground";
 import AppIcon from "@/components/AppIcon.vue";
 
 const i18n = inject<I18n>(i18nKey)!;
@@ -110,6 +118,8 @@ function reset() {
   localStorage.removeItem("toolsplus-font");
   localStorage.removeItem("toolsplus-antialias");
   localStorage.removeItem("toolsplus-webview-zoom");
+  localStorage.removeItem("toolsplus-home-bg");
+  localStorage.removeItem("toolsplus-home-bg-opacity");
   setTheme("system");
   location.reload();
 }
@@ -117,7 +127,6 @@ function reset() {
 const backdropOptions = computed(() => [
   { label: i18n.t("settings.backdrop.none"), value: "none" },
   { label: i18n.t("settings.backdrop.mica"), value: "mica" },
-  { label: i18n.t("settings.backdrop.acrylic"), value: "acrylic" },
 ]);
 
 const backdropValue = ref(getBackdrop());
@@ -175,6 +184,53 @@ function onZoomChange(e: Event) {
   const v = Number((e.target as HTMLInputElement).value);
   zoomValue.value = v;
   applyZoom(v);
+}
+
+const bgPath = ref(getHomeBackgroundPath() || "");
+const bgOpacityValue = ref(homeBackgroundOpacity().value);
+const bgUrl = ref<string | null>(null);
+const hasTauriForBg =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+async function loadBgPreview() {
+  if (!bgPath.value || !hasTauriForBg) {
+    bgUrl.value = null;
+    return;
+  }
+  try {
+    bgUrl.value = await invoke<string>("read_image_as_data_url", {
+      path: bgPath.value,
+    });
+  } catch (e) {
+    bgUrl.value = null;
+    console.error(e);
+  }
+}
+loadBgPreview();
+
+async function onPickImage() {
+  if (!hasTauriForBg) return;
+  try {
+    const picked = await invoke<string | null>("pick_image");
+    if (!picked) return;
+    bgPath.value = picked;
+    await setHomeBackground(picked);
+    await loadBgPreview();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function onClearImage() {
+  clearHomeBackground();
+  bgPath.value = "";
+  bgUrl.value = null;
+}
+
+function onBgOpacityChange(e: Event) {
+  const v = Number((e.target as HTMLInputElement).value);
+  bgOpacityValue.value = v;
+  setHomeBackgroundOpacity(v);
 }
 
 function openRepo() {
@@ -300,6 +356,63 @@ function openRepo() {
                   :checked="keepBlur"
                   @change="onKeepBlurChange(($event.target as HTMLInputElement).checked)"
                   style="width:16px;height:16px;cursor:pointer"
+                />
+              </div>
+            </div>
+          </WinExpander>
+
+          <WinExpander
+            :Height="bgPath ? 88 : 70"
+            :Header="i18n.t('settings.homebg.title')"
+            :Description="i18n.t('settings.homebg.desc')"
+            HeaderIcon="&#xE8B9;"
+          >
+            <div class="backdrop-controls">
+              <div class="opacity-row">
+                <WinButton
+                  class="reset-btn"
+                  @Click="onPickImage"
+                  :Content="i18n.t('settings.homebg.pick')"
+                />
+                <WinButton
+                  v-if="bgPath"
+                  class="reset-btn"
+                  @Click="onClearImage"
+                  :Content="i18n.t('settings.homebg.clear')"
+                />
+              </div>
+              <div v-if="bgUrl" class="bg-preview-row">
+                <img :src="bgUrl" class="bg-preview-img" alt="preview" />
+                <WinTextBlock
+                  :Text="bgPath"
+                  Style="font-size:12px;opacity:.7;flex:1;min-width:0;word-break:break-all"
+                  Foreground="secondary"
+                />
+              </div>
+              <div v-else class="opacity-row">
+                <WinTextBlock
+                  :Text="i18n.t('settings.homebg.empty')"
+                  Style="font-size:13px;opacity:.7"
+                  Foreground="secondary"
+                />
+              </div>
+              <div v-if="bgPath" class="opacity-row">
+                <WinTextBlock
+                  :Text="i18n.t('settings.backdrop.opacity')"
+                  Style="font-size:13px"
+                />
+                <input
+                  type="range"
+                  min="10"
+                  max="100"
+                  :value="bgOpacityValue"
+                  class="opacity-slider"
+                  @input="onBgOpacityChange"
+                />
+                <WinTextBlock
+                  :Text="bgOpacityValue + '%'"
+                  Style="font-size:12px;min-width:36px;text-align:right"
+                  Foreground="secondary"
                 />
               </div>
             </div>
@@ -486,6 +599,20 @@ function openRepo() {
   background: var(--ControlStrongFillColorDefaultBrush, rgba(0, 0, 0, 0.2));
   outline: none;
   cursor: pointer;
+}
+
+.bg-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.bg-preview-img {
+  width: 96px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex: 0 0 96px;
 }
 
 html.theme-dark .opacity-slider {
