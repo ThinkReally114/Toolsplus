@@ -1,0 +1,4 @@
+1→[target.x86_64-pc-windows-gnu]
+2→rustflags = ["-C", "link-args=-static"]
+3→linker = "x86_64-w64-mingw32-gcc"
+4→ar = "x86_64-w64-mingw32-ar"

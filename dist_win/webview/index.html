@@ -1,0 +1,122 @@
+  1→<!doctype html>
+  2→<html lang="en">
+  3→  <head>
+  4→    <meta charset="UTF-8" />
+  5→    <link rel="icon" type="image/svg+xml" href="./vite.svg" />
+  6→    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  7→    <title>ToolsPlus</title>
+  8→    <style>
+  9→      html, body {
+ 10→        margin: 0;
+ 11→        padding: 0;
+ 12→        background-color: #F3F3F3;
+ 13→      }
+ 14→      html.theme-dark, html.theme-dark body {
+ 15→        background-color: #202020;
+ 16→      }
+ 17→      #app-loading {
+ 18→        display: flex;
+ 19→        align-items: center;
+ 20→        justify-content: center;
+ 21→        height: 100vh;
+ 22→        font-family: "Segoe UI", system-ui, sans-serif;
+ 23→        color: #666;
+ 24→        font-size: 14px;
+ 25→      }
+ 26→      #app-error {
+ 27→        display: none;
+ 28→        padding: 20px;
+ 29→        color: #c00;
+ 30→        font-family: "Segoe UI", monospace;
+ 31→        font-size: 13px;
+ 32→        white-space: pre-wrap;
+ 33→      }
+ 34→      #app-diag {
+ 35→        position: fixed;
+ 36→        bottom: 12px;
+ 37→        left: 12px;
+ 38→        z-index: 99999;
+ 39→        background: rgba(0, 0, 0, 0.85);
+ 40→        color: #0f0;
+ 41→        font-family: "Consolas", "Segoe UI", monospace;
+ 42→        font-size: 11px;
+ 43→        padding: 10px 14px;
+ 44→        border-radius: 6px;
+ 45→        max-width: 480px;
+ 46→        max-height: 200px;
+ 47→        overflow-y: auto;
+ 48→        white-space: pre-wrap;
+ 49→        word-break: break-all;
+ 50→        display: none;
+ 51→      }
+ 52→      #app-diag.visible {
+ 53→        display: block;
+ 54→      }
+ 55→    </style>
+ 56→    <script>
+ 57→      (function () {
+ 58→        try {
+ 59→          var saved = localStorage.getItem("toolsplus-theme");
+ 60→          var mode = saved === "light" || saved === "dark" || saved === "system" ? saved : "system";
+ 61→          var resolved = mode;
+ 62→          if (mode === "system") {
+ 63→            resolved = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+ 64→          }
+ 65→          document.documentElement.classList.add("theme-" + resolved);
+ 66→          document.documentElement.setAttribute("data-theme", resolved);
+ 67→        } catch (e) {}
+ 68→      })();
+ 69→
+ 70→      // 诊断面板：应用卡死时按 F12 显示
+ 71→      (function () {
+ 72→        var diagEl = null;
+ 73→        function ensureDiag() {
+ 74→          if (diagEl) return diagEl;
+ 75→          diagEl = document.createElement("div");
+ 76→          diagEl.id = "app-diag";
+ 77→          document.body.appendChild(diagEl);
+ 78→          return diagEl;
+ 79→        }
+ 80→        function dumpDiag() {
+ 81→          var el = ensureDiag();
+ 82→          var d = window.__TOOLSPLUS_DIAG__;
+ 83→          if (!d) {
+ 84→            el.textContent = "diag not yet initialized (main.ts not loaded?)";
+ 85→            el.classList.add("visible");
+ 86→            return;
+ 87→          }
+ 88→          el.textContent =
+ 89→            "=== ToolsPlus Diagnostic ===\n" +
+ 90→            "webview2: " + d.webview2Version + "\n" +
+ 91→            "tauriOk: " + d.tauriOk + "\n" +
+ 92→            "bootMs: " + Math.round(performance.now() - d.t0) + "ms\n" +
+ 93→            "--- log ---\n" +
+ 94→            d.errors.join("\n");
+ 95→          el.classList.add("visible");
+ 96→        }
+ 97→        window.addEventListener("keydown", function (e) {
+ 98→          if (e.key === "F12") {
+ 99→            e.preventDefault();
+100→            dumpDiag();
+101→          }
+102→        });
+103→        // 10 秒后如果 main.ts 还没加载，自动显示诊断
+104→        setTimeout(function () {
+105→          var app = document.getElementById("app");
+106→          if (app && app.textContent && app.textContent.indexOf("Loading") !== -1) {
+107→            dumpDiag();
+108→          }
+109→        }, 10000);
+110→      })();
+111→    </script>
+112→    <script type="module" crossorigin src="./assets/index-hpeq328-.js"></script>
+113→    <link rel="stylesheet" crossorigin href="./assets/index-BjIsYAOr.css">
+114→  </head>
+115→
+116→  <body>
+117→    <div id="app">
+118→      <div id="app-loading">Loading ToolsPlus...</div>
+119→      <div id="app-error"></div>
+120→    </div>
+121→  </body>
+122→</html>

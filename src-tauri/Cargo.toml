@@ -1,57 +1,57 @@
-[package]
-name = "toolsplus"
-version = "0.1.0"
-description = "ToolsPlus - A collection of small tools built with Tauri"
-authors = ["ThinkReally114"]
-edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[features]
-custom-protocol = ["tauri/custom-protocol"]
-
-[lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "toolsplus_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
-[dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sysinfo = "0.32"
-windows = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Threading",
-    "Win32_System_WindowsProgramming",
-    "Win32_System_Registry",
-    "Win32_System_Wmi",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Controls",
-    "Win32_Graphics_Gdi",
-    "Win32_System_Com",
-    "Win32_System_Ole",
-    "Win32_System_Variant",
-    "Win32_Storage_FileSystem",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Dwm",
-    "Win32_Devices_DeviceAndDriverInstallation",
-    "Win32_Devices_Properties",
-    "Win32_System_Services",
-    "Win32_System_LibraryLoader",
-] }
-wmi = "0.14"
-base64 = "0.22"
-winreg = "0.52"
-rfd = "0.14"
-tauri-plugin-notification = "2.3.3"
-
+ 1→[package]
+ 2→name = "toolsplus"
+ 3→version = "0.1.0"
+ 4→description = "ToolsPlus - A collection of small tools built with Tauri"
+ 5→authors = ["ThinkReally114"]
+ 6→edition = "2021"
+ 7→
+ 8→# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+ 9→
+10→[features]
+11→custom-protocol = ["tauri/custom-protocol"]
+12→
+13→[lib]
+14→# The `_lib` suffix may seem redundant but it is necessary
+15→# to make the lib name unique and wouldn't conflict with the bin name.
+16→# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+17→name = "toolsplus_lib"
+18→crate-type = ["staticlib", "cdylib", "rlib"]
+19→
+20→[build-dependencies]
+21→tauri-build = { version = "2", features = [] }
+22→
+23→[dependencies]
+24→tauri = { version = "2", features = [] }
+25→tauri-plugin-opener = "2"
+26→serde = { version = "1", features = ["derive"] }
+27→serde_json = "1"
+28→sysinfo = "0.32"
+29→windows = { version = "0.61", features = [
+30→    "Win32_Foundation",
+31→    "Win32_Security",
+32→    "Win32_System_Threading",
+33→    "Win32_System_WindowsProgramming",
+34→    "Win32_System_Registry",
+35→    "Win32_System_Wmi",
+36→    "Win32_UI_Shell",
+37→    "Win32_UI_WindowsAndMessaging",
+38→    "Win32_UI_Controls",
+39→    "Win32_Graphics_Gdi",
+40→    "Win32_System_Com",
+41→    "Win32_System_Ole",
+42→    "Win32_System_Variant",
+43→    "Win32_Storage_FileSystem",
+44→    "Win32_Graphics_Dxgi",
+45→    "Win32_Graphics_Dxgi_Common",
+46→    "Win32_UI_Input_KeyboardAndMouse",
+47→    "Win32_Graphics_Dwm",
+48→    "Win32_Devices_DeviceAndDriverInstallation",
+49→    "Win32_Devices_Properties",
+50→    "Win32_System_Services",
+51→    "Win32_System_LibraryLoader",
+52→] }
+53→wmi = "0.14"
+54→base64 = "0.22"
+55→winreg = "0.52"
+56→rfd = "0.14"
+57→tauri-plugin-notification = "2.3.3"
